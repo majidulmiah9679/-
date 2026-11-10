@@ -19,6 +19,7 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import com.example.core.di.AppContainer
 import com.example.feature.AlexViewModel
+import com.example.feature.automation.AutomationHubScreen
 import com.example.feature.chat.ChatScreen
 import com.example.feature.history.HistoryScreen
 import com.example.feature.home.HomeScreen
@@ -39,6 +40,7 @@ object AlexRoutes {
     const val LIVE_VOICE = "live_voice"
     const val CHAT = "chat"
     const val HISTORY = "history"
+    const val AUTOMATION_HUB = "automation_hub"
     const val SETTINGS = "settings"
     const val API_CONFIG = "api_config"
     const val ABOUT = "about"
@@ -98,6 +100,30 @@ fun AlexNavigationHost(
     val selectedConversationTurns by viewModel.selectedConversationTurns.collectAsStateWithLifecycle()
     val diagnosticState by viewModel.diagnosticState.collectAsStateWithLifecycle()
 
+    // Part 2 StateFlows
+    val galleryItems by viewModel.galleryItems.collectAsStateWithLifecycle()
+    val selectedGalleryCategory by viewModel.selectedGalleryCategory.collectAsStateWithLifecycle()
+    val gallerySearchQuery by viewModel.gallerySearchQuery.collectAsStateWithLifecycle()
+    val previewGalleryItem by viewModel.previewGalleryItem.collectAsStateWithLifecycle()
+    val pendingSocialDraft by viewModel.pendingSocialDraft.collectAsStateWithLifecycle()
+    val pendingGalleryPublishDraft by viewModel.pendingGalleryPublishDraft.collectAsStateWithLifecycle()
+    val pendingDeletionChallenge by viewModel.pendingDeletionChallenge.collectAsStateWithLifecycle()
+    val automationLogs by viewModel.automationLogs.collectAsStateWithLifecycle()
+    val latestVoiceReport by viewModel.latestVoiceReport.collectAsStateWithLifecycle()
+
+    val isMasterPasswordSet by viewModel.isMasterPasswordSet.collectAsStateWithLifecycle()
+    val isVoiceProfileEnrolled by viewModel.isVoiceProfileEnrolled.collectAsStateWithLifecycle()
+    val voiceEnrollmentSampleCount by viewModel.voiceEnrollmentSampleCount.collectAsStateWithLifecycle()
+    val isVoiceOwnerVerified by viewModel.isVoiceOwnerVerified.collectAsStateWithLifecycle()
+    val securityAuditLogs by viewModel.securityAuditLogs.collectAsStateWithLifecycle()
+
+    val notificationEvents by viewModel.notificationEvents.collectAsStateWithLifecycle()
+    val isNotificationAccessConnected by viewModel.isNotificationAccessConnected.collectAsStateWithLifecycle()
+    val isAccessibilityConnected by viewModel.isAccessibilityConnected.collectAsStateWithLifecycle()
+
+    val discoveredGeminiModels by viewModel.discoveredGeminiModels.collectAsStateWithLifecycle()
+    val apiUsageMetrics by viewModel.apiUsageMetrics.collectAsStateWithLifecycle()
+
     NavHost(
         navController = navController,
         startDestination = startDestination
@@ -149,6 +175,7 @@ fun AlexNavigationHost(
                 onNavigateToLiveVoice = { navController.navigate(AlexRoutes.LIVE_VOICE) },
                 onNavigateToChat = { navController.navigate(AlexRoutes.CHAT) },
                 onNavigateToHistory = { navController.navigate(AlexRoutes.HISTORY) },
+                onNavigateToAutomationHub = { navController.navigate(AlexRoutes.AUTOMATION_HUB) },
                 onNavigateToSettings = { navController.navigate(AlexRoutes.SETTINGS) },
                 onNavigateToApiConfig = { navController.navigate(AlexRoutes.API_CONFIG) },
                 onNavigateToAbout = { navController.navigate(AlexRoutes.ABOUT) }
@@ -205,11 +232,81 @@ fun AlexNavigationHost(
             )
         }
 
+        composable(AlexRoutes.AUTOMATION_HUB) {
+            AutomationHubScreen(
+                settings = settings,
+                galleryItems = galleryItems,
+                selectedGalleryCategory = selectedGalleryCategory,
+                gallerySearchQuery = gallerySearchQuery,
+                previewGalleryItem = previewGalleryItem,
+                pendingSocialDraft = pendingSocialDraft,
+                pendingGalleryPublishDraft = pendingGalleryPublishDraft,
+                pendingDeletionChallenge = pendingDeletionChallenge,
+                automationLogs = automationLogs,
+                latestVoiceReport = latestVoiceReport,
+                isMasterPasswordSet = isMasterPasswordSet,
+                isVoiceProfileEnrolled = isVoiceProfileEnrolled,
+                voiceEnrollmentSampleCount = voiceEnrollmentSampleCount,
+                isVoiceOwnerVerified = isVoiceOwnerVerified,
+                securityAuditLogs = securityAuditLogs,
+                notificationEvents = notificationEvents,
+                isNotificationAccessConnected = isNotificationAccessConnected,
+                isAccessibilityConnected = isAccessibilityConnected,
+                onExecuteVoiceAutomationCommand = { cmd -> viewModel.executeVoiceAutomationCommand(cmd) },
+                onComposeSocialMessageDraft = { app, name, handle, msg ->
+                    viewModel.composeSocialMessageDraft(app, name, handle, msg)
+                },
+                onConfirmSocialMessage = { viewModel.confirmAndSendPendingSocialMessage() },
+                onCancelSocialMessage = { viewModel.cancelPendingSocialMessage() },
+                onSimulateWhatsAppSent = { name -> viewModel.simulateWhatsAppSentVoiceNotification(name) },
+                onSimulateIncomingSocial = { app, sender, preview ->
+                    viewModel.simulateIncomingSocialNotification(app, sender, preview)
+                },
+                onFilterGallery = { cat, q -> viewModel.filterGallery(cat, q) },
+                onSelectGalleryPreview = { item -> viewModel.selectGalleryItemForPreview(item) },
+                onImportPickedPhoto = { uri -> viewModel.importPickedPhotoUri(uri) },
+                onPrepareGallerySocialPublish = { itemId, platform, caption ->
+                    viewModel.prepareGallerySocialPublish(itemId, platform, caption)
+                },
+                onConfirmGalleryPublish = { viewModel.confirmAndPublishGalleryDraft() },
+                onCancelGalleryPublish = { viewModel.cancelPendingGalleryPublish() },
+                onRequestProtectedDeletion = { itemId -> viewModel.requestProtectedGalleryDeletion(itemId) },
+                onVerifyPasswordForDeletion = { pass ->
+                    viewModel.verifyMasterPasswordForPendingDeletion(pass)
+                },
+                onConfirmPermanentDeletion = { viewModel.confirmPermanentGalleryDeletion() },
+                onCancelPendingDeletion = { viewModel.cancelPendingGalleryDeletion() },
+                onSetOrChangeMasterPassword = { cur, next ->
+                    viewModel.setOrChangeMasterPassword(cur, next)
+                },
+                onEnrollVoiceSample = { viewModel.recordAndEnrollOwnerVoiceSample() },
+                onVerifyOwnerVoice = { viewModel.verifyOwnerVoiceNow() },
+                onResetVoiceProfile = { viewModel.resetOwnerVoiceProfile() },
+                onOpenSystemSettingsPanel = { target -> viewModel.openSystemSettingsPanel(target) },
+                onCreateQuickAlarm = { h, m, label -> viewModel.createQuickAlarm(h, m, label) },
+                onAdjustVolume = { raise -> viewModel.adjustDeviceVolume(raise) },
+                onOpenYouTubeSearch = { q -> viewModel.openYouTubeAndPlayQuery(q) },
+                onOpenChromeSearch = { q -> viewModel.openChromeAndSearchQuery(q) },
+                onOpenAccessibilitySettings = { viewModel.openAccessibilityPermissionSettings() },
+                onOpenNotificationAccessSettings = { viewModel.openNotificationListenerPermissionSettings() },
+                onUpdateNotificationVoiceSettings = { waSent, incoming, body ->
+                    viewModel.updateNotificationVoiceSettings(waSent, incoming, body)
+                },
+                onUpdateSecuritySettings = { bio, delProt, sens ->
+                    viewModel.updateSecuritySettings(bio, delProt, sens)
+                },
+                onNavigateBack = { navController.popBackStack() }
+            )
+        }
+
         composable(AlexRoutes.SETTINGS) {
             SettingsScreen(
                 settings = settings,
                 onUpdateVoiceProfile = { id, rate, pitch ->
                     viewModel.updateVoiceProfile(id, rate, pitch)
+                },
+                onUpdateVoiceEmotionStyle = { style ->
+                    viewModel.updateVoiceEmotionStyle(style)
                 },
                 onPreviewVoice = { lang -> viewModel.previewFemaleVoice(lang) },
                 onUpdatePreferredLanguage = { lang -> viewModel.updatePreferredLanguage(lang) },
@@ -219,7 +316,20 @@ fun AlexNavigationHost(
                 onUpdatePrivacySettings = { save -> viewModel.updatePrivacySettings(save) },
                 onUpdateSpeakChatReplies = { speak -> viewModel.updateSpeakChatReplies(speak) },
                 onUpdateUserTitle = { title -> viewModel.updateUserTitle(title) },
+                onUpdateNotificationVoiceSettings = { waSent, incoming, body ->
+                    viewModel.updateNotificationVoiceSettings(waSent, incoming, body)
+                },
+                onUpdateAutomationSettings = { screenAuto, socialConfirm, bgAssist ->
+                    viewModel.updateAutomationSettings(screenAuto, socialConfirm, bgAssist)
+                },
+                onUpdateSecuritySettings = { bio, delProt, sens ->
+                    viewModel.updateSecuritySettings(bio, delProt, sens)
+                },
+                onUpdateGalleryDefaultPlatform = { platform ->
+                    viewModel.updateGalleryDefaultPlatform(platform)
+                },
                 onClearAllHistory = { viewModel.clearAllHistory() },
+                onNavigateToAutomationHub = { navController.navigate(AlexRoutes.AUTOMATION_HUB) },
                 onNavigateToApiConfig = { navController.navigate(AlexRoutes.API_CONFIG) },
                 onNavigateToAbout = { navController.navigate(AlexRoutes.ABOUT) },
                 onNavigateBack = { navController.popBackStack() }
@@ -230,12 +340,18 @@ fun AlexNavigationHost(
             ApiConfigScreen(
                 settings = settings,
                 diagnosticState = diagnosticState,
+                discoveredModels = discoveredGeminiModels,
+                apiUsageMetrics = apiUsageMetrics,
                 onSaveCustomApiKey = { key ->
                     viewModel.saveCustomApiKey(key)
                 },
                 onUpdateModels = { liveModel, chatModel ->
                     viewModel.updateModels(liveModel, chatModel)
                 },
+                onUpdateAiProviderConfig = { mode, smartSwitch, groqKey ->
+                    viewModel.updateAiProviderConfig(mode, smartSwitch, groqKey)
+                },
+                onDiscoverGeminiModels = { viewModel.discoverAvailableGeminiModels() },
                 onRunDiagnostic = { viewModel.runGeminiDiagnosticTest() },
                 onNavigateBack = { navController.popBackStack() }
             )

@@ -19,4 +19,6 @@
     <string name="notification_channel_name">ALEX Live Voice Session</string>
     <string name="notification_live_title">ALEX AI Live Call Active</string>
     <string name="notification_live_text">Listening in real time. Tap to return or disconnect.</string>
+    <string name="accessibility_service_description">ALEX AI Screen Automation Service helps Boss navigate apps, click buttons, scroll screens, and execute multi-step voice commands with explicit user permission.</string>
+    <string name="notification_listener_label">ALEX AI WhatsApp &amp; Social Voice Notification Listener</string>
 </resources>

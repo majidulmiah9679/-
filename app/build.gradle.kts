@@ -19,6 +19,7 @@ android {
     versionCode = 1
     versionName = "1.0"
 
+    // Part 2 full automation, gallery, security, and 10-voice modules verified
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
 

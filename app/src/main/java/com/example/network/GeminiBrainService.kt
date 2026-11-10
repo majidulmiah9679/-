@@ -8,8 +8,10 @@ import android.util.Log
 import com.example.core.config.AlexConfig
 import com.example.core.config.NativeSystemBridge
 import com.example.domain.language.LanguageDetector
+import com.example.domain.model.AiProviderMode
 import com.example.domain.model.AlexLanguage
 import com.example.domain.model.AlexSettings
+import com.example.domain.model.ApiUsageMetrics
 import com.example.domain.model.MessageSender
 import com.example.domain.model.TranscriptTurn
 import com.google.firebase.Firebase
@@ -36,6 +38,9 @@ import java.util.Locale
 import kotlin.coroutines.cancellation.CancellationException
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.withTimeout
 import org.json.JSONObject
@@ -61,6 +66,13 @@ class GeminiBrainService(private val context: Context) {
 
     private val directApiClient = DirectGeminiApiClient()
 
+    private val _usageMetrics = MutableStateFlow(
+        ApiUsageMetrics(
+            discoveredModels = AlexConfig.AVAILABLE_CHAT_MODELS
+        )
+    )
+    val usageMetrics: StateFlow<ApiUsageMetrics> = _usageMetrics.asStateFlow()
+
     // Default generative model lazily initialized per Firebase AI Logic best practices
     private val defaultGenerativeModel: GenerativeModel by lazy {
         Firebase.ai.generativeModel(
@@ -71,7 +83,6 @@ class GeminiBrainService(private val context: Context) {
         )
     }
 
-    // Structured JSON schema for real-time multimodal voice turn understanding & reply generation
     private val liveAudioTurnSchema = Schema.obj(
         properties = mapOf(
             "heardSpeech" to Schema.boolean(
@@ -98,6 +109,31 @@ class GeminiBrainService(private val context: Context) {
         return capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
     }
 
+    suspend fun refreshDiscoveredModels(apiKey: String) {
+        val models = directApiClient.discoverSupportedModels(apiKey)
+        _usageMetrics.value = _usageMetrics.value.copy(discoveredModels = models)
+    }
+
+    private fun recordMetric(latencyMs: Long, tokensDelta: Int, providerLabel: String, usedFallback: Boolean = false) {
+        val current = _usageMetrics.value
+        val newTotal = current.totalRequests + 1
+        val newSuccess = current.successfulRequests + 1
+        val newAvg = if (current.averageLatencyMs == 0L) {
+            latencyMs
+        } else {
+            ((current.averageLatencyMs * current.successfulRequests) + latencyMs) / newSuccess
+        }
+        _usageMetrics.value = current.copy(
+            totalRequests = newTotal,
+            successfulRequests = newSuccess,
+            fallbackTriggers = current.fallbackTriggers + (if (usedFallback) 1 else 0),
+            estimatedTokensUsed = current.estimatedTokensUsed + tokensDelta.coerceAtLeast(12),
+            lastLatencyMs = latencyMs,
+            averageLatencyMs = newAvg,
+            activeProviderLabel = providerLabel
+        )
+    }
+
     private fun buildAssistantTools(): List<Tool> {
         val dateTimeTool = FunctionDeclaration(
             name = "getCurrentDateTime",
@@ -106,12 +142,12 @@ class GeminiBrainService(private val context: Context) {
         )
         val deviceTelemetryTool = FunctionDeclaration(
             name = "getDeviceTelemetry",
-            description = "Returns battery percentage and network connection status of the Android phone.",
+            description = "Returns battery percentage, network connection status, and native hardware telemetry of the Android phone.",
             parameters = emptyMap()
         )
         val languageHelpTool = FunctionDeclaration(
             name = "getLanguageCapabilities",
-            description = "Returns ALEX AI's supported languages (Bangla, English, Hindi) and voice profile info.",
+            description = "Returns ALEX AI's supported languages (Bangla, English, Hindi) and 10 human voice profiles.",
             parameters = mapOf(
                 "query" to Schema.string("Optional query about language or voice support", nullable = true)
             ),
@@ -139,7 +175,7 @@ class GeminiBrainService(private val context: Context) {
                 "[Tool Result: getDeviceTelemetry] batteryPercentage=$batteryPct%, networkOnline=$online, hardware=$hwSnapshot"
             }
             "getLanguageCapabilities" -> {
-                "[Tool Result: getLanguageCapabilities] supportedLanguages=Bangla (বাংলা), English, Hindi (हिन्दी)"
+                "[Tool Result: getLanguageCapabilities] supportedLanguages=Bangla (বাংলা), English, Hindi (हिन्दी), voices=5 Female + 5 Male"
             }
             else -> {
                 "[Tool Result: ${call.name}] executed successfully"
@@ -147,17 +183,12 @@ class GeminiBrainService(private val context: Context) {
         }
     }
 
-    /**
-     * Attempts to connect to the Gemini Live WebSocket API (`Firebase.ai.liveModel`).
-     * Returns null if a custom API key is set (handled by DirectGeminiLiveWebSocket) or if the backend channel is unavailable.
-     */
     @OptIn(PublicPreviewAPI::class)
     suspend fun tryConnectLiveWebSocketSession(settings: AlexSettings): LiveSession? {
         if (!isNetworkConnected()) {
             throw IllegalStateException("No internet connection detected. Please check Wi-Fi or mobile data.")
         }
         if (settings.customApiKey.isNotBlank()) {
-            // DirectGeminiLiveWebSocket is used instead when a manual API key is configured
             return null
         }
 
@@ -176,9 +207,10 @@ class GeminiBrainService(private val context: Context) {
             )
         }
 
+        val prebuiltVoice = AlexConfig.toGeminiPrebuiltVoiceName(settings.selectedVoiceId)
         val liveConfig = liveGenerationConfig {
             responseModality = ResponseModality.AUDIO
-            speechConfig = SpeechConfig(Voice(settings.selectedVoiceId))
+            speechConfig = SpeechConfig(Voice(prebuiltVoice))
             inputAudioTranscription = AudioTranscriptionConfig()
             outputAudioTranscription = AudioTranscriptionConfig()
             temperature = 0.8f
@@ -207,10 +239,6 @@ class GeminiBrainService(private val context: Context) {
         }
     }
 
-    /**
-     * Processes a captured 16kHz WAV voice utterance from the user in real time using either the user's
-     * manual Gemini API Key (`DirectGeminiApiClient`) or Firebase AI Logic (`gemini-3.8-flash`).
-     */
     suspend fun processLiveAudioTurn(
         wavBytes: ByteArray,
         historyTurns: List<TranscriptTurn>,
@@ -220,13 +248,21 @@ class GeminiBrainService(private val context: Context) {
             throw IllegalStateException("No internet connection. Please reconnect and try again.")
         }
 
+        val startMs = System.currentTimeMillis()
         if (settings.customApiKey.isNotBlank()) {
-            return directApiClient.processLiveAudioTurnWithKey(
+            val res = directApiClient.processLiveAudioTurnWithKey(
                 apiKey = settings.customApiKey,
                 wavBytes = wavBytes,
                 historyTurns = historyTurns,
                 settings = settings
             )
+            val elapsed = System.currentTimeMillis() - startMs
+            recordMetric(
+                latencyMs = elapsed,
+                tokensDelta = (res.userTranscript.length + res.alexReply.length) / 3,
+                providerLabel = "Gemini Direct (${settings.chatModelName})"
+            )
+            return res
         }
 
         val activeModelName = AlexConfig.sanitizeModelName(
@@ -289,6 +325,13 @@ class GeminiBrainService(private val context: Context) {
             AlexLanguage.fromCode(langCode)
         }
 
+        val elapsed = System.currentTimeMillis() - startMs
+        recordMetric(
+            latencyMs = elapsed,
+            tokensDelta = (userTranscript.length + alexReply.length) / 3,
+            providerLabel = "Firebase AI ($activeModelName)"
+        )
+
         return LiveAudioTurnResult(
             heardSpeech = heardSpeech && userTranscript.isNotBlank() && alexReply.isNotBlank(),
             userTranscript = userTranscript,
@@ -299,10 +342,6 @@ class GeminiBrainService(private val context: Context) {
 
     private fun String.isNotNotEmpty(): Boolean = this.isNotEmpty()
 
-    /**
-     * Streams a contextual, multi-turn conversational response from Gemini (`DirectGeminiApiClient` when
-     * a manual API key is set, or `Firebase.ai` by default) with a 60-second timeout window.
-     */
     fun streamChatResponse(
         prompt: String,
         historyTurns: List<TranscriptTurn>,
@@ -312,42 +351,94 @@ class GeminiBrainService(private val context: Context) {
             throw IllegalStateException("No internet connection. Please reconnect and try again.")
         }
 
-        if (settings.customApiKey.isNotBlank()) {
-            val reply = withTimeout(AlexConfig.GENERATION_TIMEOUT_MS) {
-                directApiClient.generateChatReplyWithKey(
-                    apiKey = settings.customApiKey,
+        val startMs = System.currentTimeMillis()
+
+        // 1. Explicit Groq Provider Mode
+        if (settings.aiProviderMode == AiProviderMode.GROQ_FALLBACK && settings.groqApiKey.isNotBlank()) {
+            val groqReply = withTimeout(AlexConfig.GENERATION_TIMEOUT_MS) {
+                directApiClient.generateGroqCompatibleReply(
+                    groqApiKey = settings.groqApiKey,
                     prompt = prompt,
                     historyTurns = historyTurns,
                     settings = settings
                 )
             }
-            if (reply.isBlank()) {
-                throw IllegalStateException("ALEX received an empty response from Gemini.")
-            }
-            emit(reply)
+            recordMetric(
+                latencyMs = System.currentTimeMillis() - startMs,
+                tokensDelta = (prompt.length + groqReply.length) / 4,
+                providerLabel = "Groq Llama-3.3-70B"
+            )
+            emit(groqReply)
             return@flow
         }
 
+        // 2. Direct Gemini API Key Mode (or Hybrid with Custom Key)
+        if (settings.customApiKey.isNotBlank() && settings.aiProviderMode != AiProviderMode.FIREBASE_AI) {
+            try {
+                val reply = withTimeout(AlexConfig.GENERATION_TIMEOUT_MS) {
+                    directApiClient.generateChatReplyWithKey(
+                        apiKey = settings.customApiKey,
+                        prompt = prompt,
+                        historyTurns = historyTurns,
+                        settings = settings
+                    )
+                }
+                if (reply.isBlank()) {
+                    throw IllegalStateException("ALEX received an empty response from Gemini.")
+                }
+                recordMetric(
+                    latencyMs = System.currentTimeMillis() - startMs,
+                    tokensDelta = (prompt.length + reply.length) / 4,
+                    providerLabel = "Gemini Direct (${settings.chatModelName})"
+                )
+                emit(reply)
+                return@flow
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // Automatic fallback to Groq if configured
+                if (settings.groqApiKey.isNotBlank()) {
+                    val groqFallback = directApiClient.generateGroqCompatibleReply(
+                        groqApiKey = settings.groqApiKey,
+                        prompt = prompt,
+                        historyTurns = historyTurns,
+                        settings = settings
+                    )
+                    recordMetric(
+                        latencyMs = System.currentTimeMillis() - startMs,
+                        tokensDelta = (prompt.length + groqFallback.length) / 4,
+                        providerLabel = "Groq Fallback",
+                        usedFallback = true
+                    )
+                    emit(groqFallback)
+                    return@flow
+                }
+                throw e
+            }
+        }
+
+        // 3. Firebase AI Logic Mode (with automatic model switching)
         val detectedLanguage = if (settings.preferredLanguage == AlexLanguage.AUTO) {
             LanguageDetector.detectLanguage(prompt)
         } else {
             settings.preferredLanguage
         }
 
-        val sanitizedChatModel = AlexConfig.sanitizeModelName(
-            settings.chatModelName,
-            AlexConfig.DEFAULT_CHAT_MODEL
-        )
+        val targetModelName = if (settings.autoModelSwitchingEnabled && prompt.length > 180) {
+            AlexConfig.REASONING_MODEL
+        } else {
+            AlexConfig.sanitizeModelName(settings.chatModelName, AlexConfig.DEFAULT_CHAT_MODEL)
+        }
 
         val model = if (
-            sanitizedChatModel == AlexConfig.DEFAULT_CHAT_MODEL &&
+            targetModelName == AlexConfig.DEFAULT_CHAT_MODEL &&
             settings.userTitle == AlexConfig.DEFAULT_USER_TITLE &&
             settings.preferredLanguage == AlexLanguage.AUTO
         ) {
             defaultGenerativeModel
         } else {
             Firebase.ai.generativeModel(
-                modelName = sanitizedChatModel,
+                modelName = targetModelName,
                 generationConfig = generationConfig {
                     temperature = 0.75f
                 },
@@ -384,15 +475,18 @@ class GeminiBrainService(private val context: Context) {
             }
         }
 
-        if (accumulated.isBlank()) {
+        val finalStr = accumulated.toString()
+        if (finalStr.isBlank()) {
             throw IllegalStateException("ALEX received an empty response from Gemini.")
         }
+
+        recordMetric(
+            latencyMs = System.currentTimeMillis() - startMs,
+            tokensDelta = (prompt.length + finalStr.length) / 4,
+            providerLabel = "Firebase AI ($targetModelName)"
+        )
     }
 
-    /**
-     * Runs a live diagnostic verification call against Gemini using either the user's manual API Key
-     * (`DirectGeminiApiClient`) or Firebase AI Logic + App Check.
-     */
     suspend fun runConnectionDiagnostic(settings: AlexSettings): DiagnosticTestResult {
         val startMs = System.currentTimeMillis()
         val testedModel = AlexConfig.sanitizeModelName(
@@ -411,6 +505,7 @@ class GeminiBrainService(private val context: Context) {
 
         return try {
             val text = if (settings.customApiKey.isNotBlank()) {
+                refreshDiscoveredModels(settings.customApiKey)
                 withTimeout(AlexConfig.GENERATION_TIMEOUT_MS) {
                     directApiClient.generateChatReplyWithKey(
                         apiKey = settings.customApiKey,
@@ -430,6 +525,11 @@ class GeminiBrainService(private val context: Context) {
 
             val elapsed = System.currentTimeMillis() - startMs
             if (text.isNotEmpty()) {
+                recordMetric(
+                    latencyMs = elapsed,
+                    tokensDelta = text.length / 3,
+                    providerLabel = if (settings.customApiKey.isNotBlank()) "Gemini Direct" else "Firebase AI"
+                )
                 DiagnosticTestResult(
                     success = true,
                     latencyMs = elapsed,

@@ -82,6 +82,7 @@ class DirectGeminiLiveWebSocket(
             preferredLanguage = settings.preferredLanguage,
             voiceName = settings.selectedVoiceId
         )
+        val prebuiltVoice = AlexConfig.toGeminiPrebuiltVoiceName(settings.selectedVoiceId)
 
         val setupPayload = JSONObject().apply {
             put("setup", JSONObject().apply {
@@ -91,7 +92,7 @@ class DirectGeminiLiveWebSocket(
                     put("speechConfig", JSONObject().apply {
                         put("voiceConfig", JSONObject().apply {
                             put("prebuiltVoiceConfig", JSONObject().apply {
-                                put("voiceName", settings.selectedVoiceId)
+                                put("voiceName", prebuiltVoice)
                             })
                         })
                     })
@@ -208,10 +209,43 @@ class DirectGeminiApiClient {
         return listOf(
             preferred,
             "gemini-2.5-flash",
+            "gemini-2.5-pro",
             "gemini-2.0-flash",
             "gemini-1.5-flash",
             "gemini-3.8-flash"
         ).distinct()
+    }
+
+    /**
+     * Dynamically discovers supported Gemini models from the official `v1beta/models` endpoint.
+     */
+    suspend fun discoverSupportedModels(apiKey: String): List<String> = withContext(Dispatchers.IO) {
+        val cleanKey = apiKey.trim()
+        if (cleanKey.isBlank()) {
+            return@withContext AlexConfig.AVAILABLE_CHAT_MODELS
+        }
+        val url = "https://generativelanguage.googleapis.com/v1beta/models?key=$cleanKey"
+        val request = Request.Builder().url(url).get().build()
+        runCatching {
+            httpClient.newCall(request).execute().use { response ->
+                val body = response.body?.string().orEmpty()
+                if (!response.isSuccessful || body.isBlank()) {
+                    return@use AlexConfig.AVAILABLE_CHAT_MODELS
+                }
+                val root = JSONObject(body)
+                val modelsArr = root.optJSONArray("models") ?: return@use AlexConfig.AVAILABLE_CHAT_MODELS
+                val discovered = mutableListOf<String>()
+                for (i in 0 until modelsArr.length()) {
+                    val m = modelsArr.optJSONObject(i) ?: continue
+                    val name = m.optString("name", "").removePrefix("models/")
+                    val methods = m.optJSONArray("supportedGenerationMethods")?.toString().orEmpty()
+                    if (name.startsWith("gemini") && methods.contains("generateContent")) {
+                        discovered.add(name)
+                    }
+                }
+                if (discovered.isNotEmpty()) discovered.distinct() else AlexConfig.AVAILABLE_CHAT_MODELS
+            }
+        }.getOrDefault(AlexConfig.AVAILABLE_CHAT_MODELS)
     }
 
     suspend fun generateChatReplyWithKey(
@@ -273,7 +307,70 @@ class DirectGeminiApiClient {
             )
         }
 
-        executeWithModelFallback(cleanKey, settings.chatModelName, requestJson)
+        val targetModel = selectOptimalModelForPrompt(prompt, settings)
+        executeWithModelFallback(cleanKey, targetModel, requestJson)
+    }
+
+    /**
+     * Fallback provider support for Groq / OpenAI-compatible chat completions when configured.
+     */
+    suspend fun generateGroqCompatibleReply(
+        groqApiKey: String,
+        prompt: String,
+        historyTurns: List<TranscriptTurn>,
+        settings: AlexSettings
+    ): String = withContext(Dispatchers.IO) {
+        val cleanKey = groqApiKey.trim()
+        val systemText = AlexConfig.buildSystemInstruction(
+            userTitle = settings.userTitle,
+            preferredLanguage = settings.preferredLanguage,
+            voiceName = settings.selectedVoiceId
+        )
+
+        val messages = JSONArray().apply {
+            put(JSONObject().apply {
+                put("role", "system")
+                put("content", systemText)
+            })
+            historyTurns.takeLast(10).forEach { turn ->
+                put(JSONObject().apply {
+                    put("role", if (turn.sender == MessageSender.USER) "user" else "assistant")
+                    put("content", turn.text)
+                })
+            }
+            put(JSONObject().apply {
+                put("role", "user")
+                put("content", prompt)
+            })
+        }
+
+        val payload = JSONObject().apply {
+            put("model", "llama-3.3-70b-versatile")
+            put("messages", messages)
+            put("temperature", 0.7)
+        }
+
+        val req = Request.Builder()
+            .url("https://api.groq.com/openai/v1/chat/completions")
+            .addHeader("Authorization", "Bearer $cleanKey")
+            .post(payload.toString().toRequestBody(jsonMediaType))
+            .build()
+
+        httpClient.newCall(req).execute().use { resp ->
+            val body = resp.body?.string().orEmpty()
+            if (!resp.isSuccessful || body.isBlank()) {
+                throw IllegalStateException("Groq fallback HTTP ${resp.code}")
+            }
+            val root = JSONObject(body)
+            val content = root.optJSONArray("choices")
+                ?.optJSONObject(0)
+                ?.optJSONObject("message")
+                ?.optString("content", "")
+                ?.trim()
+                .orEmpty()
+            if (content.isBlank()) throw IllegalStateException("Empty Groq response")
+            content
+        }
     }
 
     suspend fun processLiveAudioTurnWithKey(
@@ -375,6 +472,20 @@ class DirectGeminiApiClient {
         )
     }
 
+    private fun selectOptimalModelForPrompt(prompt: String, settings: AlexSettings): String {
+        if (!settings.autoModelSwitchingEnabled) return settings.chatModelName
+        val isComplexReasoning = prompt.length > 180 ||
+            prompt.contains("analyze", ignoreCase = true) ||
+            prompt.contains("architecture", ignoreCase = true) ||
+            prompt.contains("step by step", ignoreCase = true) ||
+            prompt.contains("code", ignoreCase = true)
+        return if (isComplexReasoning) {
+            "gemini-2.5-pro"
+        } else {
+            settings.chatModelName
+        }
+    }
+
     private fun executeWithModelFallback(
         apiKey: String,
         preferredModel: String,
@@ -407,7 +518,6 @@ class DirectGeminiApiClient {
                         JSONObject(bodyStr).optJSONObject("error")?.optString("message")
                     }.getOrNull() ?: "HTTP ${response.code}"
 
-                    // If API key itself is invalid (400 API_KEY_INVALID or 403), throw immediately
                     if (response.code == 400 && bodyStr.contains("API_KEY_INVALID", ignoreCase = true)) {
                         throw IllegalArgumentException("Invalid Gemini API Key. Please check the API key you entered.")
                     }

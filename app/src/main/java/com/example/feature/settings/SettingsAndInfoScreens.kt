@@ -4,6 +4,7 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -25,17 +26,21 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
+import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.NetworkCheck
 import androidx.compose.material.icons.filled.Security
+import androidx.compose.material.icons.filled.SmartToy
 import androidx.compose.material.icons.filled.VerifiedUser
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -67,8 +72,13 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import com.example.core.config.AlexConfig
 import com.example.core.config.NativeSystemBridge
+import com.example.domain.model.AiProviderMode
 import com.example.domain.model.AlexLanguage
 import com.example.domain.model.AlexSettings
+import com.example.domain.model.ApiUsageMetrics
+import com.example.domain.model.SocialPublishPlatform
+import com.example.domain.model.VoiceEmotionStyle
+import com.example.domain.model.VoiceGender
 import com.example.feature.DiagnosticUiState
 import com.example.security.SecurityAuditManager
 import com.example.ui.theme.AlexBlack
@@ -76,7 +86,6 @@ import com.example.ui.theme.AlexCardBorder
 import com.example.ui.theme.AlexCardNavy
 import com.example.ui.theme.AlexCyan
 import com.example.ui.theme.AlexDeepNavy
-import com.example.ui.theme.AlexElectricBlue
 import com.example.ui.theme.AlexStatusDisconnected
 import com.example.ui.theme.AlexStatusReady
 import com.example.ui.theme.AlexSurfaceNavy
@@ -87,13 +96,19 @@ import com.example.ui.theme.AlexTextSecondary
 fun SettingsScreen(
     settings: AlexSettings,
     onUpdateVoiceProfile: (String, Float, Float) -> Unit,
+    onUpdateVoiceEmotionStyle: (VoiceEmotionStyle) -> Unit = {},
     onPreviewVoice: (AlexLanguage) -> Unit,
     onUpdatePreferredLanguage: (AlexLanguage) -> Unit,
     onUpdateAudioControls: (Boolean, Boolean, Boolean, Float) -> Unit,
     onUpdatePrivacySettings: (Boolean) -> Unit,
     onUpdateSpeakChatReplies: (Boolean) -> Unit,
     onUpdateUserTitle: (String) -> Unit,
+    onUpdateNotificationVoiceSettings: (Boolean, Boolean, Boolean) -> Unit = { _, _, _ -> },
+    onUpdateAutomationSettings: (Boolean, Boolean, Boolean) -> Unit = { _, _, _ -> },
+    onUpdateSecuritySettings: (Boolean, Boolean, Boolean) -> Unit = { _, _, _ -> },
+    onUpdateGalleryDefaultPlatform: (SocialPublishPlatform) -> Unit = {},
     onClearAllHistory: () -> Unit,
+    onNavigateToAutomationHub: () -> Unit = {},
     onNavigateToApiConfig: () -> Unit,
     onNavigateToAbout: () -> Unit,
     onNavigateBack: () -> Unit
@@ -103,6 +118,7 @@ fun SettingsScreen(
     }
 
     var bossTitleDraft by remember(settings.userTitle) { mutableStateOf(settings.userTitle) }
+    var selectedGenderFilter by remember { mutableStateOf<VoiceGender?>(null) }
 
     Box(
         modifier = Modifier
@@ -142,12 +158,12 @@ fun SettingsScreen(
                     }
                     Column {
                         Text(
-                            text = "ALEX SYSTEM SETTINGS",
+                            text = "ALEX 20-MODULE SETTINGS",
                             style = MaterialTheme.typography.headlineMedium,
                             color = AlexCyan
                         )
                         Text(
-                            text = "VOICE • LANGUAGE • AUDIO DUPLEX • PRIVACY",
+                            text = "10 VOICES • AUTOMATION • SECURITY • AI BRAIN",
                             style = MaterialTheme.typography.labelMedium,
                             color = AlexTextSecondary
                         )
@@ -155,6 +171,13 @@ fun SettingsScreen(
                 }
 
                 Row {
+                    IconButton(onClick = onNavigateToAutomationHub) {
+                        Icon(
+                            imageVector = Icons.Default.SmartToy,
+                            contentDescription = "Automation Hub",
+                            tint = AlexCyan
+                        )
+                    }
                     IconButton(onClick = onNavigateToApiConfig) {
                         Icon(
                             imageVector = Icons.Default.Key,
@@ -172,11 +195,81 @@ fun SettingsScreen(
                 }
             }
 
+            Spacer(modifier = Modifier.height(10.dp))
+
+            // Quick Banner to Open Part 2 Automation, Gallery & Security Command Center
+            Button(
+                onClick = onNavigateToAutomationHub,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = AlexCyan,
+                    contentColor = AlexBlack
+                ),
+                shape = RoundedCornerShape(14.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(50.dp)
+                    .testTag("open_automation_hub_from_settings")
+            ) {
+                Icon(imageVector = Icons.Default.SmartToy, contentDescription = null)
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = "OPEN AUTOMATION, GALLERY & SECURITY HUB",
+                    fontWeight = FontWeight.Bold
+                )
+            }
+
             Spacer(modifier = Modifier.height(14.dp))
 
-            // 1. FEMALE VOICE CONFIGURATION
-            SettingsSectionCard(title = "1. FEMALE HUMAN-LIKE VOICE PROFILE") {
-                AlexConfig.FEMALE_VOICES.forEach { voice ->
+            // 1. 10 REALISTIC HUMAN VOICES (5 FEMALE + 5 MALE) & EMOTION STYLE
+            SettingsSectionCard(title = "1. REALISTIC HUMAN VOICE SYSTEM (5 FEMALE + 5 MALE VOICES)") {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    FilterChip(
+                        selected = selectedGenderFilter == null,
+                        onClick = { selectedGenderFilter = null },
+                        label = { Text("ALL 10 VOICES") },
+                        colors = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = AlexCyan,
+                            selectedLabelColor = AlexBlack
+                        )
+                    )
+                    FilterChip(
+                        selected = selectedGenderFilter == VoiceGender.FEMALE,
+                        onClick = { selectedGenderFilter = VoiceGender.FEMALE },
+                        label = { Text("5 FEMALE VOICES") },
+                        modifier = Modifier.testTag("filter_female_voices"),
+                        colors = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = AlexCyan,
+                            selectedLabelColor = AlexBlack
+                        )
+                    )
+                    FilterChip(
+                        selected = selectedGenderFilter == VoiceGender.MALE,
+                        onClick = { selectedGenderFilter = VoiceGender.MALE },
+                        label = { Text("5 MALE VOICES") },
+                        modifier = Modifier.testTag("filter_male_voices"),
+                        colors = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = AlexCyan,
+                            selectedLabelColor = AlexBlack
+                        )
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                val displayedVoices = remember(selectedGenderFilter) {
+                    when (selectedGenderFilter) {
+                        VoiceGender.FEMALE -> AlexConfig.FEMALE_VOICES
+                        VoiceGender.MALE -> AlexConfig.MALE_VOICES
+                        null -> AlexConfig.ALL_HUMAN_VOICES
+                    }
+                }
+
+                displayedVoices.forEach { voice ->
                     val isSelected = settings.selectedVoiceId == voice.id
                     Surface(
                         modifier = Modifier
@@ -214,12 +307,22 @@ fun SettingsScreen(
                             )
                             Spacer(modifier = Modifier.width(8.dp))
                             Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    text = voice.displayName,
-                                    style = MaterialTheme.typography.titleMedium,
-                                    color = AlexTextPrimary,
-                                    fontWeight = FontWeight.Bold
-                                )
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    Text(
+                                        text = voice.displayName,
+                                        style = MaterialTheme.typography.titleMedium,
+                                        color = AlexTextPrimary,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                    Text(
+                                        text = "[${voice.gender.displayName.uppercase()}]",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = AlexCyan
+                                    )
+                                }
                                 Text(
                                     text = voice.toneDescription,
                                     style = MaterialTheme.typography.bodyMedium,
@@ -231,6 +334,33 @@ fun SettingsScreen(
                 }
 
                 Spacer(modifier = Modifier.height(10.dp))
+
+                Text(
+                    text = "Voice Emotion & Delivery Style:",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = AlexTextSecondary
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    VoiceEmotionStyle.entries.forEach { style ->
+                        FilterChip(
+                            selected = settings.voiceEmotionStyle == style,
+                            onClick = { onUpdateVoiceEmotionStyle(style) },
+                            label = { Text(style.displayName) },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = AlexCyan,
+                                selectedLabelColor = AlexBlack
+                            )
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(8.dp))
 
                 Text(
                     text = "Speaking Speed: ${"%.2f".format(settings.speechRate)}x",
@@ -250,7 +380,24 @@ fun SettingsScreen(
                 )
 
                 Text(
-                    text = "Preview Female Voice in Language:",
+                    text = "Voice Pitch: ${"%.2f".format(settings.voicePitch)}x",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = AlexTextPrimary
+                )
+                Slider(
+                    value = settings.voicePitch,
+                    onValueChange = { pitch ->
+                        onUpdateVoiceProfile(settings.selectedVoiceId, settings.speechRate, pitch)
+                    },
+                    valueRange = 0.8f..1.25f,
+                    colors = SliderDefaults.colors(
+                        thumbColor = AlexCyan,
+                        activeTrackColor = AlexCyan
+                    )
+                )
+
+                Text(
+                    text = "Preview Selected Voice in Language:",
                     style = MaterialTheme.typography.labelMedium,
                     color = AlexTextSecondary
                 )
@@ -396,7 +543,7 @@ fun SettingsScreen(
                 )
                 SettingToggleRow(
                     title = "Speak Text Chat Replies Aloud",
-                    subtitle = "Use ALEX's female voice to read responses in Text Chat mode",
+                    subtitle = "Use ALEX's selected voice to read responses in Text Chat mode",
                     checked = settings.speakChatReplies,
                     onCheckedChange = onUpdateSpeakChatReplies
                 )
@@ -404,10 +551,88 @@ fun SettingsScreen(
 
             Spacer(modifier = Modifier.height(14.dp))
 
-            // 4. PRIVACY & DATA CONTROLS
-            SettingsSectionCard(title = "4. PRIVACY & CONVERSATION STORAGE") {
+            // 4. WHATSAPP, SOCIAL AUTOMATION & ACCESSIBILITY SETTINGS
+            SettingsSectionCard(title = "4. WHATSAPP VOICE ALERTS & MOBILE AUTOMATION") {
                 SettingToggleRow(
-                    title = "Save Text Conversation History",
+                    title = "WhatsApp Sent Message Voice Announcement",
+                    subtitle = "Announce: \"Boss, your WhatsApp message has been sent successfully.\"",
+                    checked = settings.whatsappVoiceNotificationEnabled,
+                    onCheckedChange = {
+                        onUpdateNotificationVoiceSettings(
+                            it,
+                            settings.announceIncomingMessagesEnabled,
+                            settings.readIncomingMessageContentAloud
+                        )
+                    }
+                )
+                SettingToggleRow(
+                    title = "Incoming Social Notification Voice Alert",
+                    subtitle = "Announce incoming messages from WhatsApp, Messenger, Instagram & Telegram",
+                    checked = settings.announceIncomingMessagesEnabled,
+                    onCheckedChange = {
+                        onUpdateNotificationVoiceSettings(
+                            settings.whatsappVoiceNotificationEnabled,
+                            it,
+                            settings.readIncomingMessageContentAloud
+                        )
+                    }
+                )
+                SettingToggleRow(
+                    title = "Accessibility Screen Automation",
+                    subtitle = "Allow ALEX to click buttons, scroll, and execute multi-step screen tasks",
+                    checked = settings.socialMediaAutomationEnabled,
+                    onCheckedChange = {
+                        onUpdateAutomationSettings(
+                            it,
+                            settings.socialMediaAutomationEnabled,
+                            settings.backgroundAutomationServiceEnabled
+                        )
+                    }
+                )
+                SettingToggleRow(
+                    title = "Background Personal Assistant Readiness",
+                    subtitle = "Keep voice & notification automation responsive while multitasking",
+                    checked = settings.backgroundAutomationServiceEnabled,
+                    onCheckedChange = {
+                        onUpdateAutomationSettings(
+                            settings.socialMediaAutomationEnabled,
+                            settings.socialMediaAutomationEnabled,
+                            it
+                        )
+                    }
+                )
+            }
+
+            Spacer(modifier = Modifier.height(14.dp))
+
+            // 5. MASTER PASSWORD, BIOMETRIC & DELETE PROTECTION
+            SettingsSectionCard(title = "5. MASTER PASSWORD, DELETE PROTECTION & PRIVACY") {
+                SettingToggleRow(
+                    title = "Master Password Delete Protection",
+                    subtitle = "Never delete any photo, video, or file without Master Password verification",
+                    checked = settings.deleteProtectionEnabled,
+                    onCheckedChange = {
+                        onUpdateSecuritySettings(
+                            settings.biometricSecurityEnabled,
+                            it,
+                            settings.sensitiveActionProtectionEnabled
+                        )
+                    }
+                )
+                SettingToggleRow(
+                    title = "Biometric Security Lock",
+                    subtitle = "Enable biometric verification alongside Master Password",
+                    checked = settings.biometricSecurityEnabled,
+                    onCheckedChange = {
+                        onUpdateSecuritySettings(
+                            it,
+                            settings.deleteProtectionEnabled,
+                            settings.sensitiveActionProtectionEnabled
+                        )
+                    }
+                )
+                SettingToggleRow(
+                    title = "Save Text Conversation History & Memory",
                     subtitle = "Store text transcripts locally in Room DB. Raw audio is never saved to disk.",
                     checked = settings.saveHistoryEnabled,
                     onCheckedChange = onUpdatePrivacySettings
@@ -434,7 +659,7 @@ fun SettingsScreen(
                             .weight(1f)
                             .testTag("open_api_config_from_settings")
                     ) {
-                        Text("API & SECURITY")
+                        Text("API & AI BRAIN")
                     }
                 }
             }
@@ -448,8 +673,12 @@ fun SettingsScreen(
 fun ApiConfigScreen(
     settings: AlexSettings,
     diagnosticState: DiagnosticUiState,
+    discoveredModels: List<String> = AlexConfig.AVAILABLE_CHAT_MODELS,
+    apiUsageMetrics: ApiUsageMetrics = ApiUsageMetrics(),
     onSaveCustomApiKey: (String) -> Unit,
     onUpdateModels: (String, String) -> Unit,
+    onUpdateAiProviderConfig: (AiProviderMode, Boolean, String) -> Unit = { _, _, _ -> },
+    onDiscoverGeminiModels: () -> Unit = {},
     onRunDiagnostic: () -> Unit,
     onNavigateBack: () -> Unit
 ) {
@@ -459,6 +688,7 @@ fun ApiConfigScreen(
 
     val securityDiagnostics by SecurityAuditManager.diagnostics.collectAsState()
     var apiKeyDraft by remember(settings.customApiKey) { mutableStateOf(settings.customApiKey) }
+    var groqKeyDraft by remember(settings.groqApiKey) { mutableStateOf(settings.groqApiKey) }
     var showApiKeyPlaintext by remember { mutableStateOf(false) }
     var savedConfirmationVisible by remember { mutableStateOf(false) }
 
@@ -497,12 +727,12 @@ fun ApiConfigScreen(
                 }
                 Column {
                     Text(
-                        text = "GEMINI API & SECURITY",
+                        text = "GEMINI MULTI-MODEL AI BRAIN",
                         style = MaterialTheme.typography.headlineMedium,
                         color = AlexCyan
                     )
                     Text(
-                        text = "MANUAL API KEY • ZERO-TRUST FIREBASE AI LOGIC",
+                        text = "API KEY • DYNAMIC MODELS • FALLBACK • METRICS",
                         style = MaterialTheme.typography.labelMedium,
                         color = AlexTextSecondary
                     )
@@ -511,7 +741,7 @@ fun ApiConfigScreen(
 
             Spacer(modifier = Modifier.height(14.dp))
 
-            // 1. MANUAL GEMINI API KEY INPUT CARD (User Requested Feature)
+            // 1. MANUAL GEMINI API KEY INPUT CARD
             SettingsSectionCard(title = "1. MANUAL GEMINI API KEY (নিজের API Key বসান)") {
                 val hasActiveKey = settings.customApiKey.isNotBlank()
                 Surface(
@@ -664,12 +894,87 @@ fun ApiConfigScreen(
 
             Spacer(modifier = Modifier.height(14.dp))
 
-            // 2. LIVE CONNECTION DIAGNOSTIC RUNNER
-            SettingsSectionCard(title = "2. LIVE GEMINI CONNECTION DIAGNOSTIC") {
+            // 2. AI PROVIDER MANAGER & GROQ FALLBACK
+            SettingsSectionCard(title = "2. AI PROVIDER ROUTING & SMART MODEL SWITCHING") {
+                AiProviderMode.entries.forEach { mode ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable {
+                                onUpdateAiProviderConfig(
+                                    mode,
+                                    settings.autoModelSwitchingEnabled,
+                                    groqKeyDraft
+                                )
+                            }
+                            .padding(vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        RadioButton(
+                            selected = settings.aiProviderMode == mode,
+                            onClick = {
+                                onUpdateAiProviderConfig(
+                                    mode,
+                                    settings.autoModelSwitchingEnabled,
+                                    groqKeyDraft
+                                )
+                            },
+                            colors = RadioButtonDefaults.colors(selectedColor = AlexCyan)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = mode.displayName,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = AlexTextPrimary
+                        )
+                    }
+                }
+
+                SettingToggleRow(
+                    title = "Smart Multi-Model Task Switching & Fallback",
+                    subtitle = "Automatically route fast requests to Flash and complex reasoning to Pro with automatic fallback",
+                    checked = settings.autoModelSwitchingEnabled,
+                    onCheckedChange = {
+                        onUpdateAiProviderConfig(
+                            settings.aiProviderMode,
+                            it,
+                            groqKeyDraft
+                        )
+                    }
+                )
+
+                Spacer(modifier = Modifier.height(6.dp))
+                OutlinedTextField(
+                    value = groqKeyDraft,
+                    onValueChange = {
+                        groqKeyDraft = it
+                        onUpdateAiProviderConfig(
+                            settings.aiProviderMode,
+                            settings.autoModelSwitchingEnabled,
+                            it
+                        )
+                    },
+                    label = { Text("Optional Groq Fallback API Key (gsk_...)") },
+                    singleLine = true,
+                    visualTransformation = PasswordVisualTransformation(),
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = AlexCyan,
+                        unfocusedBorderColor = AlexCardBorder,
+                        focusedTextColor = AlexTextPrimary,
+                        unfocusedTextColor = AlexTextPrimary
+                    )
+                )
+            }
+
+            Spacer(modifier = Modifier.height(14.dp))
+
+            // 3. LIVE CONNECTION DIAGNOSTIC & TOKEN USAGE METRICS
+            SettingsSectionCard(title = "3. LIVE GEMINI CONNECTION DIAGNOSTIC & USAGE METRICS") {
                 Text(
-                    text = "Verify real-time connectivity and Gemini model response latency using your active API Key or Firebase AI Logic.",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = AlexTextSecondary
+                    text = "Requests: ${apiUsageMetrics.totalRequests} (${apiUsageMetrics.successfulRequests} OK) • Est. Tokens: ${apiUsageMetrics.estimatedTokensUsed} • Last Latency: ${apiUsageMetrics.lastLatencyMs} ms",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = AlexCyan
                 )
                 Spacer(modifier = Modifier.height(10.dp))
                 Button(
@@ -741,8 +1046,8 @@ fun ApiConfigScreen(
 
             Spacer(modifier = Modifier.height(14.dp))
 
-            // 3. GEMINI LIVE MODEL CONFIGURATION
-            SettingsSectionCard(title = "3. CENTRALIZED GEMINI LIVE AUDIO MODEL") {
+            // 4. GEMINI LIVE MODEL CONFIGURATION
+            SettingsSectionCard(title = "4. CENTRALIZED GEMINI LIVE AUDIO MODEL") {
                 AlexConfig.AVAILABLE_LIVE_MODELS.forEach { modelId ->
                     Row(
                         modifier = Modifier
@@ -768,9 +1073,21 @@ fun ApiConfigScreen(
 
             Spacer(modifier = Modifier.height(14.dp))
 
-            // 4. GEMINI BRAIN / CHAT MODEL CONFIGURATION
-            SettingsSectionCard(title = "4. CENTRALIZED GEMINI BRAIN MODEL") {
-                AlexConfig.AVAILABLE_CHAT_MODELS.forEach { modelId ->
+            // 5. GEMINI BRAIN / CHAT MODEL CONFIGURATION + DYNAMIC DISCOVERY
+            SettingsSectionCard(title = "5. CENTRALIZED GEMINI BRAIN MODEL (DYNAMIC DISCOVERY)") {
+                OutlinedButton(
+                    onClick = onDiscoverGeminiModels,
+                    border = BorderStroke(1.dp, AlexCyan),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("discover_models_button")
+                ) {
+                    Icon(imageVector = Icons.Default.AutoAwesome, contentDescription = null, tint = AlexCyan, modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("FETCH AVAILABLE GEMINI MODELS FROM API", color = AlexCyan)
+                }
+                Spacer(modifier = Modifier.height(6.dp))
+                discoveredModels.forEach { modelId ->
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -795,8 +1112,8 @@ fun ApiConfigScreen(
 
             Spacer(modifier = Modifier.height(14.dp))
 
-            // 5. ZERO-TRUST SECURITY AUDIT CARD
-            SettingsSectionCard(title = "5. ZERO-TRUST API SECURITY ATTESTATION") {
+            // 6. ZERO-TRUST SECURITY AUDIT CARD
+            SettingsSectionCard(title = "6. ZERO-TRUST API SECURITY ATTESTATION") {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(10.dp)
@@ -831,15 +1148,6 @@ fun ApiConfigScreen(
                     style = MaterialTheme.typography.bodyMedium,
                     color = AlexTextSecondary
                 )
-            }
-
-            Spacer(modifier = Modifier.height(14.dp))
-
-            // 6. GITHUB ACTIONS DIRECT APK CI/CD WORKFLOW STATUS
-            SettingsSectionCard(title = "6. GITHUB ACTIONS DIRECT APK BUILD (.github/workflows/build-apk.yml)") {
-                CapabilityBullet("Push-to-Build Active: গিটহাবে পুশ করলেই স্বয়ংক্রিয়ভাবে APK বিল্ড চালু হবে")
-                CapabilityBullet("Artifact Output: ALEX-AI-v1.0.0-debug.apk (GitHub Actions & Releases)")
-                CapabilityBullet("Native Stack: Kotlin + Java (NativeSystemBridge.java) + Jetpack Compose")
             }
 
             Spacer(modifier = Modifier.height(24.dp))
@@ -900,7 +1208,7 @@ fun AboutScreen(
                         color = AlexCyan
                     )
                     Text(
-                        text = "VERSION ${AlexConfig.APP_VERSION} • NATIVE KOTLIN + JAVA",
+                        text = "VERSION ${AlexConfig.APP_VERSION} • PART 1 & PART 2 COMPLETE",
                         style = MaterialTheme.typography.labelMedium,
                         color = AlexTextSecondary
                     )
@@ -911,7 +1219,7 @@ fun AboutScreen(
 
             SettingsSectionCard(title = "PERSONALITY & IDENTITY") {
                 Text(
-                    text = "ALEX is an intelligent, friendly, emotionally aware female personal AI assistant who addresses you as \"Boss\" and communicates naturally across live voice calls and text.",
+                    text = "ALEX is an intelligent, friendly, emotionally aware personal AI assistant & mobile automation commander who addresses you as \"Boss\" and communicates naturally across live voice calls, text, and system automation.",
                     style = MaterialTheme.typography.bodyLarge,
                     color = AlexTextPrimary
                 )
@@ -929,22 +1237,15 @@ fun AboutScreen(
 
             Spacer(modifier = Modifier.height(12.dp))
 
-            SettingsSectionCard(title = "GITHUB DIRECT APK AUTO-BUILD WORKFLOW") {
-                CapabilityBullet("Workflow File: .github/workflows/build-apk.yml")
-                CapabilityBullet("Trigger: গিটহাবে কোড Push করলেই স্বয়ংক্রিয়ভাবে APK বিল্ড শুরু হয়")
-                CapabilityBullet("Artifact & Release: ডাউনলোডযোগ্য ALEX-AI-v1.0.0-debug.apk তৈরি হয়")
-            }
-
-            Spacer(modifier = Modifier.height(12.dp))
-
-            SettingsSectionCard(title = "CORE TECHNICAL CAPABILITIES") {
+            SettingsSectionCard(title = "PART 1 & PART 2 FULL CAPABILITIES") {
                 CapabilityBullet("Full-Duplex Gemini Live Voice Streaming (16kHz PCM In / 24kHz PCM Out)")
-                CapabilityBullet("Natural Female Voice Profiles: Aoede, Kore, Leda & Zephyr")
-                CapabilityBullet("Automatic Multilingual Intelligence: Bangla (বাংলা), English & Hindi (हिन्दी)")
-                CapabilityBullet("Real-Time Voice Activity Detection (VAD) & Barge-In Interruption")
-                CapabilityBullet("Hardware Acoustic Echo Cancellation (AEC) & Noise Suppression (NS)")
-                CapabilityBullet("Local Room Database & DataStore Preferences with Privacy Controls")
-                CapabilityBullet("Manual Gemini API Key Input + Zero-Trust Firebase AI Logic")
+                CapabilityBullet("10 Realistic Human Voices: 5 Female (Aoede, Leda, Kore, Callirrhoe, Zephyr) + 5 Male (Charon, Puck, Fenrir, Orus, Enceladus)")
+                CapabilityBullet("WhatsApp Message Sent Voice Alert: \"Boss, your WhatsApp message has been sent successfully.\"")
+                CapabilityBullet("Universal Social Media Message Automation (WhatsApp, Messenger, Instagram, Telegram)")
+                CapabilityBullet("Full Android Accessibility Screen Automation & Multi-Step Task Execution")
+                CapabilityBullet("Phone Gallery Organizer, Visual Tag Search & Social Media Publisher")
+                CapabilityBullet("Android Keystore Master Password + Mandatory Delete Protection Challenge")
+                CapabilityBullet("Personal Acoustic Voice Biometric Authentication (3-Sample Enrollment)")
             }
 
             Spacer(modifier = Modifier.height(24.dp))

@@ -89,6 +89,7 @@ import com.example.ui.theme.AlexElectricBlue
 import com.example.ui.theme.AlexStatusConnecting
 import com.example.ui.theme.AlexStatusDisconnected
 import com.example.ui.theme.AlexStatusReady
+import androidx.compose.material.icons.filled.SmartToy
 import com.example.ui.theme.AlexSurfaceNavy
 import com.example.ui.theme.AlexTextMuted
 import com.example.ui.theme.AlexTextPrimary
@@ -115,6 +116,7 @@ fun HomeScreen(
     onNavigateToLiveVoice: () -> Unit,
     onNavigateToChat: () -> Unit,
     onNavigateToHistory: () -> Unit,
+    onNavigateToAutomationHub: () -> Unit = {},
     onNavigateToSettings: () -> Unit,
     onNavigateToApiConfig: () -> Unit,
     onNavigateToAbout: () -> Unit
@@ -296,6 +298,16 @@ fun HomeScreen(
                         )
                     }
                     IconButton(
+                        onClick = onNavigateToAutomationHub,
+                        modifier = Modifier.testTag("nav_automation_hub_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.SmartToy,
+                            contentDescription = "Automation & Gallery Hub",
+                            tint = AlexCyan
+                        )
+                    }
+                    IconButton(
                         onClick = onNavigateToApiConfig,
                         modifier = Modifier.testTag("nav_api_config_button")
                     ) {
@@ -320,8 +332,9 @@ fun HomeScreen(
 
             Spacer(modifier = Modifier.height(8.dp))
 
-            // 2. STATUS INDICATOR BADGE + QUICK MANUAL API KEY BUTTON
+            // 2. STATUS INDICATOR BADGE + QUICK MANUAL API KEY BUTTON + AUTOMATION HUB CHIP
             Row(
+                modifier = Modifier.horizontalScroll(rememberScrollState()),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
@@ -360,6 +373,33 @@ fun HomeScreen(
                             text = if (settings.customApiKey.isNotBlank()) "API KEY: ONLINE" else "SET API KEY",
                             style = MaterialTheme.typography.labelMedium,
                             color = if (settings.customApiKey.isNotBlank()) AlexStatusReady else AlexCyan
+                        )
+                    }
+                }
+
+                Surface(
+                    modifier = Modifier
+                        .clickable { onNavigateToAutomationHub() }
+                        .testTag("home_automation_hub_chip"),
+                    shape = RoundedCornerShape(50),
+                    color = AlexCardNavy,
+                    border = BorderStroke(1.dp, AlexCyan)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.SmartToy,
+                            contentDescription = "Automation & Gallery Command Center",
+                            tint = AlexCyan,
+                            modifier = Modifier.size(14.dp)
+                        )
+                        Text(
+                            text = "AUTOMATION & GALLERY",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = AlexCyan
                         )
                     }
                 }

@@ -6,8 +6,11 @@ import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.speech.tts.Voice
 import android.util.Log
+import com.example.core.config.AlexConfig
 import com.example.domain.language.LanguageDetector
 import com.example.domain.model.AlexLanguage
+import com.example.domain.model.VoiceEmotionStyle
+import com.example.domain.model.VoiceGender
 import java.util.Locale
 import java.util.UUID
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -30,6 +33,7 @@ class FemaleVoiceSynthesizer(context: Context) {
     private var currentVoiceProfileId: String = "Aoede"
     private var currentSpeechRate: Float = 1.0f
     private var currentPitch: Float = 1.02f
+    private var currentEmotionStyle: VoiceEmotionStyle = VoiceEmotionStyle.NATURAL
 
     var onSpeechStarted: (() -> Unit)? = null
     var onSpeechCompleted: (() -> Unit)? = null
@@ -39,7 +43,7 @@ class FemaleVoiceSynthesizer(context: Context) {
             tts = TextToSpeech(context.applicationContext) { status ->
                 if (status == TextToSpeech.SUCCESS) {
                     isInitialized = true
-                    configureDefaultFemaleVoice(AlexLanguage.ENGLISH)
+                    configureDefaultHumanVoice(AlexLanguage.ENGLISH)
                 } else {
                     Log.w(TAG, "TextToSpeech init returned status: $status")
                 }
@@ -70,7 +74,6 @@ class FemaleVoiceSynthesizer(context: Context) {
                         end: Int,
                         frame: Int
                     ) {
-                        // Modulate amplitude naturally on word boundaries for authentic waveform motion
                         val wordLength = (end - start).coerceIn(1, 12)
                         _ttsAmplitude.value = (0.35f + (wordLength / 18f)).coerceIn(0.3f, 0.92f)
                     }
@@ -81,30 +84,38 @@ class FemaleVoiceSynthesizer(context: Context) {
         }
     }
 
-    fun updateVoiceConfig(voiceId: String, speechRate: Float, pitch: Float) {
+    fun updateVoiceConfig(
+        voiceId: String,
+        speechRate: Float,
+        pitch: Float,
+        emotionStyle: VoiceEmotionStyle = currentEmotionStyle
+    ) {
         currentVoiceProfileId = voiceId
-        currentSpeechRate = speechRate.coerceIn(0.75f, 1.35f)
-        // Subtle pitch adjustments to differentiate female voice personas naturally
-        val profilePitchOffset = when (voiceId) {
-            "Aoede" -> 0.02f
-            "Kore" -> 0.0f
-            "Leda" -> -0.02f
-            "Zephyr" -> 0.05f
-            else -> 0.02f
-        }
-        currentPitch = (pitch + profilePitchOffset).coerceIn(0.85f, 1.25f)
+        currentEmotionStyle = emotionStyle
+        val voiceOption = AlexConfig.findVoiceById(voiceId)
+
+        val effectiveRate = (speechRate + voiceOption.defaultRateOffset) * emotionStyle.rateMultiplier
+        val effectivePitch = (pitch + voiceOption.defaultPitchOffset) * emotionStyle.pitchMultiplier
+
+        currentSpeechRate = effectiveRate.coerceIn(0.70f, 1.45f)
+        currentPitch = effectivePitch.coerceIn(0.70f, 1.35f)
         tts?.setSpeechRate(currentSpeechRate)
         tts?.setPitch(currentPitch)
     }
 
-    private fun configureDefaultFemaleVoice(language: AlexLanguage) {
+    private fun configureDefaultHumanVoice(language: AlexLanguage) {
         val engine = tts ?: return
         if (!isInitialized) return
+
+        val voiceOption = AlexConfig.findVoiceById(currentVoiceProfileId)
+        val prefersIndianEnglish = currentVoiceProfileId == "Aoede" || currentVoiceProfileId == "Puck"
 
         val targetLocale = when (language) {
             AlexLanguage.BANGLA -> Locale("bn", "BD")
             AlexLanguage.HINDI -> Locale("hi", "IN")
-            AlexLanguage.ENGLISH, AlexLanguage.AUTO -> Locale.US
+            AlexLanguage.ENGLISH, AlexLanguage.AUTO -> {
+                if (prefersIndianEnglish) Locale("en", "IN") else Locale.US
+            }
         }
 
         try {
@@ -116,16 +127,27 @@ class FemaleVoiceSynthesizer(context: Context) {
                 if (engine.isLanguageAvailable(fallbackBn) >= TextToSpeech.LANG_AVAILABLE) {
                     engine.language = fallbackBn
                 }
+            } else if (prefersIndianEnglish) {
+                engine.language = Locale.US
             }
 
-            // Select high-quality female voice matching the target language when available
             val voices: Set<Voice>? = engine.voices
-            val preferredVoice = voices
-                ?.filter { v ->
-                    v.locale.language.equals(targetLocale.language, ignoreCase = true) &&
-                        !v.isNetworkConnectionRequired
-                }
-                ?.firstOrNull { v ->
+            val matchingLanguageVoices = voices?.filter { v ->
+                v.locale.language.equals(targetLocale.language, ignoreCase = true) &&
+                    !v.isNetworkConnectionRequired
+            }.orEmpty()
+
+            val preferredVoice = if (voiceOption.gender == VoiceGender.MALE) {
+                matchingLanguageVoices.firstOrNull { v ->
+                    val nameLower = v.name.lowercase()
+                    nameLower.contains("male") && !nameLower.contains("female") ||
+                        nameLower.contains("#m") ||
+                        nameLower.contains("m0") ||
+                        nameLower.contains("iom") ||
+                        nameLower.contains("tpd")
+                } ?: matchingLanguageVoices.lastOrNull()
+            } else {
+                matchingLanguageVoices.firstOrNull { v ->
                     val nameLower = v.name.lowercase()
                     nameLower.contains("female") ||
                         nameLower.contains("#f") ||
@@ -134,7 +156,8 @@ class FemaleVoiceSynthesizer(context: Context) {
                         nameLower.contains("tpf") ||
                         nameLower.contains("bn-bd-x") ||
                         nameLower.contains("hi-in-x")
-                } ?: voices?.firstOrNull { v ->
+                } ?: matchingLanguageVoices.firstOrNull()
+            } ?: voices?.firstOrNull { v ->
                 v.locale.language.equals(targetLocale.language, ignoreCase = true)
             }
 
@@ -164,7 +187,7 @@ class FemaleVoiceSynthesizer(context: Context) {
             languageOverride
         }
 
-        configureDefaultFemaleVoice(detectedLanguage)
+        configureDefaultHumanVoice(detectedLanguage)
 
         val queueMode = if (flushExisting) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
         val params = Bundle().apply {
