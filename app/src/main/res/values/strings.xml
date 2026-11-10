@@ -1,0 +1,22 @@
+<resources>
+    <string name="app_name">Alex AI</string>
+    <string name="alex_title">ALEX AI</string>
+    <string name="alex_subtitle">PERSONAL LIVE AI ASSISTANT</string>
+    <string name="status_ready">READY</string>
+    <string name="status_listening">LISTENING</string>
+    <string name="status_thinking">THINKING</string>
+    <string name="status_speaking">SPEAKING</string>
+    <string name="status_connecting">CONNECTING</string>
+    <string name="status_disconnected">DISCONNECTED</string>
+    <string name="btn_start_live">START LIVE</string>
+    <string name="btn_end_call">END CALL</string>
+    <string name="btn_mute_mic">MUTE MIC</string>
+    <string name="btn_unmute_mic">UNMUTE MIC</string>
+    <string name="btn_settings">SETTINGS</string>
+    <string name="btn_reconnect">RECONNECT</string>
+    <string name="permission_mic_title">Microphone Access Required</string>
+    <string name="permission_mic_rationale">ALEX AI needs microphone access to hear your voice in real time during live full-duplex conversations. Audio is streamed securely to Gemini Live and is never recorded secretly or saved to disk.</string>
+    <string name="notification_channel_name">ALEX Live Voice Session</string>
+    <string name="notification_live_title">ALEX AI Live Call Active</string>
+    <string name="notification_live_text">Listening in real time. Tap to return or disconnect.</string>
+</resources>

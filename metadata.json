@@ -1,0 +1,6 @@
+{
+  "name": "Alex AI",
+  "description": "Futuristic multilingual personal live AI voice and chat assistant powered by Gemini.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
