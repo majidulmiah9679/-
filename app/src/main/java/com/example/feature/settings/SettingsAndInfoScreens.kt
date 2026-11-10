@@ -1047,18 +1047,28 @@ fun ApiConfigScreen(
             Spacer(modifier = Modifier.height(14.dp))
 
             // 4. GEMINI LIVE MODEL CONFIGURATION
-            SettingsSectionCard(title = "4. CENTRALIZED GEMINI LIVE AUDIO MODEL") {
-                AlexConfig.AVAILABLE_LIVE_MODELS.forEach { modelId ->
+            val allLiveAndDiscoveredModels = remember(discoveredModels) {
+                (AlexConfig.AVAILABLE_LIVE_MODELS + discoveredModels).distinct()
+            }
+            SettingsSectionCard(title = "4. CENTRALIZED GEMINI LIVE AUDIO MODEL (ALL MODELS)") {
+                Text(
+                    text = "যেকোনো মডেল সিলেক্ট করুন (৩.৮ সহ সব মডেল সাপোর্টেড)। কোনো মডেলে Free Tier Quota (20/day) শেষ হলে স্বয়ংক্রিয়ভাবে পরবর্তী সচল মডেলে ভয়েস অ্যাসিস্ট্যান্ট কাজ করবে।",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = AlexTextSecondary
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+                allLiveAndDiscoveredModels.forEach { modelId ->
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .clickable { onUpdateModels(modelId, settings.chatModelName) }
-                            .padding(vertical = 6.dp),
+                            .clickable { onUpdateModels(modelId, modelId) }
+                            .padding(vertical = 6.dp)
+                            .testTag("live_model_option_$modelId"),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         RadioButton(
                             selected = settings.liveModelName == modelId,
-                            onClick = { onUpdateModels(modelId, settings.chatModelName) },
+                            onClick = { onUpdateModels(modelId, modelId) },
                             colors = RadioButtonDefaults.colors(selectedColor = AlexCyan)
                         )
                         Spacer(modifier = Modifier.width(8.dp))
@@ -1074,6 +1084,9 @@ fun ApiConfigScreen(
             Spacer(modifier = Modifier.height(14.dp))
 
             // 5. GEMINI BRAIN / CHAT MODEL CONFIGURATION + DYNAMIC DISCOVERY
+            val allBrainModels = remember(discoveredModels) {
+                (AlexConfig.AVAILABLE_CHAT_MODELS + discoveredModels).distinct()
+            }
             SettingsSectionCard(title = "5. CENTRALIZED GEMINI BRAIN MODEL (DYNAMIC DISCOVERY)") {
                 OutlinedButton(
                     onClick = onDiscoverGeminiModels,
@@ -1087,17 +1100,18 @@ fun ApiConfigScreen(
                     Text("FETCH AVAILABLE GEMINI MODELS FROM API", color = AlexCyan)
                 }
                 Spacer(modifier = Modifier.height(6.dp))
-                discoveredModels.forEach { modelId ->
+                allBrainModels.forEach { modelId ->
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .clickable { onUpdateModels(settings.liveModelName, modelId) }
-                            .padding(vertical = 6.dp),
+                            .clickable { onUpdateModels(modelId, modelId) }
+                            .padding(vertical = 6.dp)
+                            .testTag("brain_model_option_$modelId"),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         RadioButton(
                             selected = settings.chatModelName == modelId,
-                            onClick = { onUpdateModels(settings.liveModelName, modelId) },
+                            onClick = { onUpdateModels(modelId, modelId) },
                             colors = RadioButtonDefaults.colors(selectedColor = AlexCyan)
                         )
                         Spacer(modifier = Modifier.width(8.dp))

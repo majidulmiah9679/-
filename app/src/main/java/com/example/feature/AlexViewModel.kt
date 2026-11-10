@@ -732,7 +732,11 @@ class AlexViewModel(
 
     fun updateModels(liveModel: String, chatModel: String) {
         viewModelScope.launch {
+            container.geminiBrainService.clearQuotaCache()
             container.preferencesRepository.updateModels(liveModel, chatModel)
+            val updated = settings.value.copy(liveModelName = liveModel, chatModelName = chatModel)
+            container.liveSessionController.syncSettings(updated)
+            container.liveSessionController.clearError()
         }
     }
 
@@ -838,6 +842,7 @@ class AlexViewModel(
     fun saveCustomApiKey(apiKey: String) {
         val clean = apiKey.trim()
         viewModelScope.launch {
+            container.geminiBrainService.clearQuotaCache()
             container.preferencesRepository.updateCustomApiKey(clean)
             val updatedSettings = settings.value.copy(customApiKey = clean)
             container.liveSessionController.syncSettings(updatedSettings)

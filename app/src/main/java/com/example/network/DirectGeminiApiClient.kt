@@ -8,6 +8,8 @@ import com.example.domain.model.AlexLanguage
 import com.example.domain.model.AlexSettings
 import com.example.domain.model.MessageSender
 import com.example.domain.model.TranscriptTurn
+import java.util.Collections
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.Dispatchers
@@ -76,6 +78,15 @@ class DirectGeminiLiveWebSocket(
         })
     }
 
+    private fun resolveBidiModelName(selectedLiveModel: String): String {
+        val clean = selectedLiveModel.trim().removePrefix("models/")
+        return when {
+            clean.isBlank() -> "models/gemini-2.0-flash-exp"
+            clean.contains("tts", ignoreCase = true) -> "models/gemini-2.0-flash-exp"
+            else -> "models/$clean"
+        }
+    }
+
     private fun sendInitialSetup(ws: WebSocket) {
         val systemText = AlexConfig.buildSystemInstruction(
             userTitle = settings.userTitle,
@@ -83,10 +94,11 @@ class DirectGeminiLiveWebSocket(
             voiceName = settings.selectedVoiceId
         )
         val prebuiltVoice = AlexConfig.toGeminiPrebuiltVoiceName(settings.selectedVoiceId)
+        val targetBidiModel = resolveBidiModelName(settings.liveModelName)
 
         val setupPayload = JSONObject().apply {
             put("setup", JSONObject().apply {
-                put("model", "models/gemini-2.0-flash-exp")
+                put("model", targetBidiModel)
                 put("generationConfig", JSONObject().apply {
                     put("responseModalities", JSONArray().put("AUDIO"))
                     put("speechConfig", JSONObject().apply {
@@ -198,22 +210,79 @@ class DirectGeminiLiveWebSocket(
 class DirectGeminiApiClient {
 
     private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(25, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
-        .writeTimeout(30, TimeUnit.SECONDS)
+        .connectTimeout(20, TimeUnit.SECONDS)
+        .readTimeout(45, TimeUnit.SECONDS)
+        .writeTimeout(25, TimeUnit.SECONDS)
         .build()
 
     private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
 
-    private fun candidateModelsFor(preferred: String): List<String> {
-        return listOf(
-            preferred,
-            "gemini-2.5-flash",
-            "gemini-2.5-pro",
-            "gemini-2.0-flash",
-            "gemini-1.5-flash",
-            "gemini-3.8-flash"
-        ).distinct()
+    // Caches models discovered from v1beta/models for a given API key
+    private val discoveredModelsCache = ConcurrentHashMap<String, List<String>>()
+
+    // Tracks models that returned 429 Quota Exceeded so we immediately route to working models
+    private val quotaExhaustedModels: MutableSet<String> = Collections.synchronizedSet(mutableSetOf())
+
+    @Volatile
+    var lastSucceededModel: String = AlexConfig.DEFAULT_CHAT_MODEL
+        private set
+
+    fun clearQuotaCache() {
+        quotaExhaustedModels.clear()
+    }
+
+    /**
+     * Builds an ordered list of all candidate Gemini models, starting with the user's selected
+     * Live & Chat models, followed by high-quota Flash-Lite / Flash / 2.0 / 3.x models and any
+     * dynamically discovered models supported by the user's API key.
+     */
+    private fun candidateModelsFor(
+        primaryModel: String,
+        secondaryModel: String = "",
+        discoveredForKey: List<String> = emptyList(),
+        requireAudioMultimodal: Boolean = false
+    ): List<String> {
+        val rawOrdered = buildList {
+            if (primaryModel.isNotBlank() && !primaryModel.contains("tts", ignoreCase = true)) {
+                add(primaryModel.removePrefix("models/"))
+            }
+            if (secondaryModel.isNotBlank() && !secondaryModel.contains("tts", ignoreCase = true)) {
+                add(secondaryModel.removePrefix("models/"))
+            }
+            // High-quota & universal models across Gemini 3.x, 2.5, and 2.0 families
+            add("gemini-2.5-flash-lite")
+            add("gemini-3.5-flash-lite")
+            add("gemini-2.0-flash-lite")
+            add("gemini-flash-lite-latest")
+            add("gemini-2.5-flash")
+            add("gemini-2.0-flash")
+            add("gemini-flash-latest")
+            add("gemini-3.8-flash")
+            add("gemini-3-flash-preview")
+            add("gemini-2.5-pro")
+            add("gemini-4-argon")
+            if (!requireAudioMultimodal) {
+                add("gemma-3-27b-it")
+                add("gemma-3-12b-it")
+            }
+            // Append all dynamically discovered models for this API key (excluding TTS/embedding-only models)
+            discoveredForKey.forEach { m ->
+                val clean = m.removePrefix("models/")
+                if (!clean.contains("tts", ignoreCase = true) &&
+                    !clean.contains("embedding", ignoreCase = true) &&
+                    !clean.contains("imagen", ignoreCase = true) &&
+                    !clean.contains("veo", ignoreCase = true) &&
+                    (!requireAudioMultimodal || clean.startsWith("gemini"))
+                ) {
+                    add(clean)
+                }
+            }
+        }.distinct()
+
+        // Place non-exhausted models first, and keep quota-exhausted models at the very end as last-resort
+        val activeCandidates = rawOrdered.filterNot { quotaExhaustedModels.contains(it) }
+        val exhaustedCandidates = rawOrdered.filter { quotaExhaustedModels.contains(it) }
+        return activeCandidates + exhaustedCandidates
     }
 
     /**
@@ -224,9 +293,13 @@ class DirectGeminiApiClient {
         if (cleanKey.isBlank()) {
             return@withContext AlexConfig.AVAILABLE_CHAT_MODELS
         }
+        discoveredModelsCache[cleanKey]?.let { cached ->
+            if (cached.isNotEmpty()) return@withContext cached
+        }
+
         val url = "https://generativelanguage.googleapis.com/v1beta/models?key=$cleanKey"
         val request = Request.Builder().url(url).get().build()
-        runCatching {
+        val result = runCatching {
             httpClient.newCall(request).execute().use { response ->
                 val body = response.body?.string().orEmpty()
                 if (!response.isSuccessful || body.isBlank()) {
@@ -239,13 +312,19 @@ class DirectGeminiApiClient {
                     val m = modelsArr.optJSONObject(i) ?: continue
                     val name = m.optString("name", "").removePrefix("models/")
                     val methods = m.optJSONArray("supportedGenerationMethods")?.toString().orEmpty()
-                    if (name.startsWith("gemini") && methods.contains("generateContent")) {
+                    if ((name.startsWith("gemini") || name.startsWith("gemma")) &&
+                        methods.contains("generateContent")
+                    ) {
                         discovered.add(name)
                     }
                 }
-                if (discovered.isNotEmpty()) discovered.distinct() else AlexConfig.AVAILABLE_CHAT_MODELS
+                val merged = (AlexConfig.AVAILABLE_CHAT_MODELS + discovered).distinct()
+                if (merged.isNotEmpty()) merged else AlexConfig.AVAILABLE_CHAT_MODELS
             }
         }.getOrDefault(AlexConfig.AVAILABLE_CHAT_MODELS)
+
+        discoveredModelsCache[cleanKey] = result
+        result
     }
 
     suspend fun generateChatReplyWithKey(
@@ -255,6 +334,10 @@ class DirectGeminiApiClient {
         settings: AlexSettings
     ): String = withContext(Dispatchers.IO) {
         val cleanKey = apiKey.trim()
+        val discovered = discoveredModelsCache[cleanKey] ?: runCatching {
+            discoverSupportedModels(cleanKey)
+        }.getOrDefault(emptyList())
+
         val detectedLanguage = if (settings.preferredLanguage == AlexLanguage.AUTO) {
             LanguageDetector.detectLanguage(prompt)
         } else {
@@ -307,8 +390,42 @@ class DirectGeminiApiClient {
             )
         }
 
-        val targetModel = selectOptimalModelForPrompt(prompt, settings)
-        executeWithModelFallback(cleanKey, targetModel, requestJson)
+        // Also prepare a fallback payload with system instruction inlined for models (like Gemma) that don't accept system_instruction
+        val inlinedContents = JSONArray().apply {
+            put(
+                JSONObject().apply {
+                    put("role", "user")
+                    put(
+                        "parts",
+                        JSONArray().put(
+                            JSONObject().apply {
+                                put("text", "$systemInstruction\n\nUser (${settings.userTitle}): $prompt")
+                            }
+                        )
+                    )
+                }
+            )
+        }
+        val fallbackRequestJson = JSONObject().apply {
+            put("contents", inlinedContents)
+            put("generationConfig", JSONObject().apply { put("temperature", 0.75) })
+        }
+
+        val primaryModel = selectOptimalModelForPrompt(prompt, settings)
+        val secondaryModel = settings.liveModelName
+        val candidates = candidateModelsFor(
+            primaryModel = primaryModel,
+            secondaryModel = secondaryModel,
+            discoveredForKey = discovered,
+            requireAudioMultimodal = false
+        )
+
+        executeWithModelFallback(
+            apiKey = cleanKey,
+            candidates = candidates,
+            requestBodyJson = requestJson,
+            inlinedFallbackBodyJson = fallbackRequestJson
+        )
     }
 
     /**
@@ -369,6 +486,7 @@ class DirectGeminiApiClient {
                 ?.trim()
                 .orEmpty()
             if (content.isBlank()) throw IllegalStateException("Empty Groq response")
+            lastSucceededModel = "groq/llama-3.3-70b"
             content
         }
     }
@@ -380,6 +498,10 @@ class DirectGeminiApiClient {
         settings: AlexSettings
     ): LiveAudioTurnResult = withContext(Dispatchers.IO) {
         val cleanKey = apiKey.trim()
+        val discovered = discoveredModelsCache[cleanKey] ?: runCatching {
+            discoverSupportedModels(cleanKey)
+        }.getOrDefault(emptyList())
+
         val base64Wav = Base64.encodeToString(wavBytes, Base64.NO_WRAP)
 
         val recentContext = historyTurns
@@ -446,74 +568,140 @@ class DirectGeminiApiClient {
             )
         }
 
-        val rawResponse = executeWithModelFallback(cleanKey, settings.chatModelName, requestJson)
+        val fallbackNoMimeJson = JSONObject().apply {
+            put(
+                "contents",
+                JSONArray().put(
+                    JSONObject().apply {
+                        put("role", "user")
+                        put("parts", userParts)
+                    }
+                )
+            )
+            put("generationConfig", JSONObject().apply { put("temperature", 0.7) })
+        }
+
+        // Prioritize settings.liveModelName first, then settings.chatModelName, then all multimodal models
+        val candidates = candidateModelsFor(
+            primaryModel = settings.liveModelName,
+            secondaryModel = settings.chatModelName,
+            discoveredForKey = discovered,
+            requireAudioMultimodal = true
+        )
+
+        val rawResponse = executeWithModelFallback(
+            apiKey = cleanKey,
+            candidates = candidates,
+            requestBodyJson = requestJson,
+            inlinedFallbackBodyJson = fallbackNoMimeJson
+        )
+
+        parseLiveAudioTurnResponse(rawResponse, settings)
+    }
+
+    private fun parseLiveAudioTurnResponse(
+        rawResponse: String,
+        settings: AlexSettings
+    ): LiveAudioTurnResult {
         val cleanJsonString = rawResponse
+            .trim()
             .removePrefix("```json")
+            .removePrefix("```JSON")
             .removePrefix("```")
             .removeSuffix("```")
             .trim()
 
-        val json = JSONObject(cleanJsonString)
-        val heardSpeech = json.optBoolean("heardSpeech", false)
-        val userTranscript = json.optString("userTranscript", "").trim()
-        val alexReply = json.optString("alexReply", "").trim()
-        val langCode = json.optString("languageCode", "EN")
-        val detectedLang = if (userTranscript.isNotEmpty()) {
-            LanguageDetector.detectLanguage(userTranscript)
-        } else {
-            AlexLanguage.fromCode(langCode)
+        return try {
+            val startBrace = cleanJsonString.indexOf('{')
+            val endBrace = cleanJsonString.lastIndexOf('}')
+            val jsonCandidate = if (startBrace >= 0 && endBrace > startBrace) {
+                cleanJsonString.substring(startBrace, endBrace + 1)
+            } else {
+                cleanJsonString
+            }
+            val json = JSONObject(jsonCandidate)
+            val heardSpeech = json.optBoolean("heardSpeech", true)
+            val userTranscript = json.optString("userTranscript", "").trim()
+            val alexReply = json.optString("alexReply", "").trim()
+            val langCode = json.optString("languageCode", "EN")
+            val detectedLang = when {
+                userTranscript.isNotEmpty() -> LanguageDetector.detectLanguage(userTranscript)
+                alexReply.isNotEmpty() -> LanguageDetector.detectLanguage(alexReply)
+                else -> AlexLanguage.fromCode(langCode)
+            }
+            LiveAudioTurnResult(
+                heardSpeech = heardSpeech && alexReply.isNotBlank(),
+                userTranscript = userTranscript.ifBlank { "(Voice message)" },
+                alexReply = alexReply,
+                language = detectedLang
+            )
+        } catch (_: Exception) {
+            // Graceful fallback if the model returned plain spoken text instead of JSON
+            val lang = LanguageDetector.detectLanguage(cleanJsonString)
+            LiveAudioTurnResult(
+                heardSpeech = cleanJsonString.isNotBlank(),
+                userTranscript = "(Voice input)",
+                alexReply = cleanJsonString,
+                language = if (settings.preferredLanguage == AlexLanguage.AUTO) lang else settings.preferredLanguage
+            )
         }
-
-        LiveAudioTurnResult(
-            heardSpeech = heardSpeech && userTranscript.isNotBlank() && alexReply.isNotBlank(),
-            userTranscript = userTranscript,
-            alexReply = alexReply,
-            language = detectedLang
-        )
     }
 
     private fun selectOptimalModelForPrompt(prompt: String, settings: AlexSettings): String {
-        if (!settings.autoModelSwitchingEnabled) return settings.chatModelName
-        val isComplexReasoning = prompt.length > 180 ||
-            prompt.contains("analyze", ignoreCase = true) ||
-            prompt.contains("architecture", ignoreCase = true) ||
-            prompt.contains("step by step", ignoreCase = true) ||
-            prompt.contains("code", ignoreCase = true)
-        return if (isComplexReasoning) {
-            "gemini-2.5-pro"
+        val baseModel = if (settings.chatModelName.contains("tts", ignoreCase = true)) {
+            if (!settings.liveModelName.contains("tts", ignoreCase = true)) {
+                settings.liveModelName
+            } else {
+                AlexConfig.FAST_CHAT_MODEL
+            }
         } else {
             settings.chatModelName
+        }
+
+        if (!settings.autoModelSwitchingEnabled) return baseModel
+        val isComplexReasoning = prompt.length > 220 ||
+            prompt.contains("architecture", ignoreCase = true) ||
+            prompt.contains("step by step", ignoreCase = true)
+        return if (isComplexReasoning && !quotaExhaustedModels.contains(baseModel)) {
+            baseModel
+        } else {
+            baseModel
         }
     }
 
     private fun executeWithModelFallback(
         apiKey: String,
-        preferredModel: String,
-        requestBodyJson: JSONObject
+        candidates: List<String>,
+        requestBodyJson: JSONObject,
+        inlinedFallbackBodyJson: JSONObject? = null
     ): String {
-        val candidates = candidateModelsFor(preferredModel)
+        var firstMeaningfulError: String? = null
         var lastError = "Unable to reach Gemini API."
 
         for (modelName in candidates) {
-            val url = "https://generativelanguage.googleapis.com/v1beta/models/$modelName:generateContent?key=$apiKey"
+            val cleanModel = modelName.trim().removePrefix("models/")
+            if (cleanModel.isBlank()) continue
+
+            val useInlined = cleanModel.startsWith("gemma", ignoreCase = true) && inlinedFallbackBodyJson != null
+            val activePayload = if (useInlined) inlinedFallbackBodyJson!! else requestBodyJson
+
+            val url = "https://generativelanguage.googleapis.com/v1beta/models/$cleanModel:generateContent?key=$apiKey"
             val request = Request.Builder()
                 .url(url)
-                .post(requestBodyJson.toString().toRequestBody(jsonMediaType))
+                .post(activePayload.toString().toRequestBody(jsonMediaType))
                 .build()
 
-            httpClient.newCall(request).execute().use { response ->
-                val bodyStr = response.body?.string().orEmpty()
-                if (response.isSuccessful && bodyStr.isNotBlank()) {
-                    val root = JSONObject(bodyStr)
-                    val candidatesArr = root.optJSONArray("candidates")
-                    val firstCandidate = candidatesArr?.optJSONObject(0)
-                    val content = firstCandidate?.optJSONObject("content")
-                    val parts = content?.optJSONArray("parts")
-                    val text = parts?.optJSONObject(0)?.optString("text", "")?.trim().orEmpty()
-                    if (text.isNotEmpty()) {
-                        return text
+            val attemptResult = runCatching {
+                httpClient.newCall(request).execute().use { response ->
+                    val bodyStr = response.body?.string().orEmpty()
+                    if (response.isSuccessful && bodyStr.isNotBlank()) {
+                        val extracted = extractTextFromGenerateContentResponse(bodyStr)
+                        if (extracted.isNotEmpty()) {
+                            lastSucceededModel = cleanModel
+                            return extracted
+                        }
                     }
-                } else {
+
                     val errorMsg = runCatching {
                         JSONObject(bodyStr).optJSONObject("error")?.optString("message")
                     }.getOrNull() ?: "HTTP ${response.code}"
@@ -521,11 +709,59 @@ class DirectGeminiApiClient {
                     if (response.code == 400 && bodyStr.contains("API_KEY_INVALID", ignoreCase = true)) {
                         throw IllegalArgumentException("Invalid Gemini API Key. Please check the API key you entered.")
                     }
-                    lastError = "$modelName: $errorMsg"
+
+                    if (response.code == 429 || errorMsg.contains("quota", ignoreCase = true) || errorMsg.contains("rate", ignoreCase = true)) {
+                        quotaExhaustedModels.add(cleanModel)
+                    }
+
+                    // If 400 due to system_instruction or responseMimeType not supported by this model, retry once with simplified body
+                    if (response.code == 400 && inlinedFallbackBodyJson != null && !useInlined) {
+                        val retryReq = Request.Builder()
+                            .url(url)
+                            .post(inlinedFallbackBodyJson.toString().toRequestBody(jsonMediaType))
+                            .build()
+                        httpClient.newCall(retryReq).execute().use { retryResp ->
+                            val retryBody = retryResp.body?.string().orEmpty()
+                            if (retryResp.isSuccessful && retryBody.isNotBlank()) {
+                                val extractedRetry = extractTextFromGenerateContentResponse(retryBody)
+                                if (extractedRetry.isNotEmpty()) {
+                                    lastSucceededModel = cleanModel
+                                    return extractedRetry
+                                }
+                            }
+                        }
+                    }
+
+                    val formattedErr = "$cleanModel: $errorMsg"
+                    if (firstMeaningfulError == null) {
+                        firstMeaningfulError = formattedErr
+                    }
+                    lastError = formattedErr
                 }
+            }
+
+            if (attemptResult.isFailure) {
+                val ex = attemptResult.exceptionOrNull()
+                if (ex is IllegalArgumentException) throw ex
+                lastError = "$cleanModel: ${ex?.localizedMessage ?: "Network error"}"
             }
         }
 
-        throw IllegalStateException(lastError)
+        throw IllegalStateException(firstMeaningfulError ?: lastError)
+    }
+
+    private fun extractTextFromGenerateContentResponse(bodyStr: String): String {
+        val root = JSONObject(bodyStr)
+        val candidatesArr = root.optJSONArray("candidates") ?: return ""
+        val firstCandidate = candidatesArr.optJSONObject(0) ?: return ""
+        val content = firstCandidate.optJSONObject("content") ?: return ""
+        val parts = content.optJSONArray("parts") ?: return ""
+        val sb = StringBuilder()
+        for (i in 0 until parts.length()) {
+            val part = parts.optJSONObject(i) ?: continue
+            val t = part.optString("text", "")
+            if (t.isNotEmpty()) sb.append(t)
+        }
+        return sb.toString().trim()
     }
 }

@@ -109,9 +109,38 @@ class GeminiBrainService(private val context: Context) {
         return capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
     }
 
+    fun clearQuotaCache() {
+        directApiClient.clearQuotaCache()
+    }
+
     suspend fun refreshDiscoveredModels(apiKey: String) {
         val models = directApiClient.discoverSupportedModels(apiKey)
         _usageMetrics.value = _usageMetrics.value.copy(discoveredModels = models)
+    }
+
+    private fun firebaseCandidateModels(settings: AlexSettings, preferReasoning: Boolean = false): List<String> {
+        val liveClean = AlexConfig.sanitizeModelName(settings.liveModelName, AlexConfig.DEFAULT_LIVE_MODEL)
+        val chatClean = AlexConfig.sanitizeModelName(settings.chatModelName, AlexConfig.DEFAULT_CHAT_MODEL)
+        val rawList = buildList {
+            if (preferReasoning) {
+                add(AlexConfig.REASONING_MODEL)
+            }
+            if (!liveClean.contains("-tts", ignoreCase = true)) {
+                add(liveClean)
+            }
+            if (!chatClean.contains("-tts", ignoreCase = true)) {
+                add(chatClean)
+            }
+            add("gemini-3.5-flash-lite")
+            add("gemini-2.5-flash-lite")
+            add("gemini-2.5-flash")
+            add("gemini-2.0-flash-lite")
+            add("gemini-2.0-flash")
+            add("gemini-2.5-pro")
+            add("gemini-3.8-flash")
+            add("gemini-4-argon")
+        }
+        return rawList.distinct()
     }
 
     private fun recordMetric(latencyMs: Long, tokensDelta: Int, providerLabel: String, usedFallback: Boolean = false) {
@@ -250,25 +279,27 @@ class GeminiBrainService(private val context: Context) {
 
         val startMs = System.currentTimeMillis()
         if (settings.customApiKey.isNotBlank()) {
-            val res = directApiClient.processLiveAudioTurnWithKey(
-                apiKey = settings.customApiKey,
-                wavBytes = wavBytes,
-                historyTurns = historyTurns,
-                settings = settings
-            )
-            val elapsed = System.currentTimeMillis() - startMs
-            recordMetric(
-                latencyMs = elapsed,
-                tokensDelta = (res.userTranscript.length + res.alexReply.length) / 3,
-                providerLabel = "Gemini Direct (${settings.chatModelName})"
-            )
-            return res
+            try {
+                val res = directApiClient.processLiveAudioTurnWithKey(
+                    apiKey = settings.customApiKey,
+                    wavBytes = wavBytes,
+                    historyTurns = historyTurns,
+                    settings = settings
+                )
+                val elapsed = System.currentTimeMillis() - startMs
+                val modelUsed = directApiClient.lastSucceededModel.ifBlank { settings.liveModelName }
+                recordMetric(
+                    latencyMs = elapsed,
+                    tokensDelta = (res.userTranscript.length + res.alexReply.length) / 3,
+                    providerLabel = "Gemini Direct ($modelUsed)"
+                )
+                return res
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "Custom API key live audio failed (${e.message}), falling back to Firebase AI Logic multi-model pool")
+            }
         }
-
-        val activeModelName = AlexConfig.sanitizeModelName(
-            settings.chatModelName,
-            AlexConfig.DEFAULT_CHAT_MODEL
-        )
 
         val recentContext = historyTurns
             .takeLast(8)
@@ -277,70 +308,82 @@ class GeminiBrainService(private val context: Context) {
                 "$speaker: ${turn.text}"
             }
 
-        val multimodalAudioModel = Firebase.ai.generativeModel(
-            modelName = activeModelName,
-            generationConfig = generationConfig {
-                responseMimeType = "application/json"
-                responseSchema = liveAudioTurnSchema
-                temperature = 0.75f
-            },
-            systemInstruction = content {
-                text(
-                    AlexConfig.buildSystemInstruction(
-                        userTitle = settings.userTitle,
-                        preferredLanguage = settings.preferredLanguage,
-                        voiceName = settings.selectedVoiceId
-                    )
+        var lastException: Exception? = null
+        val candidates = firebaseCandidateModels(settings)
+        for ((index, candidateModel) in candidates.withIndex()) {
+            try {
+                val multimodalAudioModel = Firebase.ai.generativeModel(
+                    modelName = candidateModel,
+                    generationConfig = generationConfig {
+                        responseMimeType = "application/json"
+                        responseSchema = liveAudioTurnSchema
+                        temperature = 0.75f
+                    },
+                    systemInstruction = content {
+                        text(
+                            AlexConfig.buildSystemInstruction(
+                                userTitle = settings.userTitle,
+                                preferredLanguage = settings.preferredLanguage,
+                                voiceName = settings.selectedVoiceId
+                            )
+                        )
+                    }
                 )
-            }
-        )
 
-        val response = withTimeout(AlexConfig.GENERATION_TIMEOUT_MS) {
-            multimodalAudioModel.generateContent(
-                content {
-                    inlineData(wavBytes, AlexConfig.AUDIO_WAV_MIME_TYPE)
-                    text(
-                        buildString {
-                            append("Listen to this live voice audio from ${settings.userTitle}. ")
-                            append("If intelligible speech is present in Bangla (বাংলা), English, or Hindi (हिन्दी), ")
-                            append("transcribe it accurately and provide ALEX's natural spoken response in the same language. ")
-                            if (recentContext.isNotBlank()) {
-                                append("\nRecent conversation context:\n$recentContext")
-                            }
+                val response = withTimeout(AlexConfig.GENERATION_TIMEOUT_MS) {
+                    multimodalAudioModel.generateContent(
+                        content {
+                            inlineData(wavBytes, AlexConfig.AUDIO_WAV_MIME_TYPE)
+                            text(
+                                buildString {
+                                    append("Listen to this live voice audio from ${settings.userTitle}. ")
+                                    append("If intelligible speech is present in Bangla (বাংলা), English, or Hindi (हिन्दी), ")
+                                    append("transcribe it accurately and provide ALEX's natural spoken response in the same language. ")
+                                    if (recentContext.isNotBlank()) {
+                                        append("\nRecent conversation context:\n$recentContext")
+                                    }
+                                }
+                            )
                         }
                     )
                 }
-            )
+
+                val rawJson = response.text ?: throw IllegalStateException("Empty audio understanding response.")
+                val json = JSONObject(rawJson)
+                val heardSpeech = json.optBoolean("heardSpeech", false)
+                val userTranscript = json.optString("userTranscript", "").trim()
+                val alexReply = json.optString("alexReply", "").trim()
+                val langCode = json.optString("languageCode", "EN")
+                val detectedLang = if (userTranscript.isNotEmpty()) {
+                    LanguageDetector.detectLanguage(userTranscript)
+                } else {
+                    AlexLanguage.fromCode(langCode)
+                }
+
+                val elapsed = System.currentTimeMillis() - startMs
+                recordMetric(
+                    latencyMs = elapsed,
+                    tokensDelta = (userTranscript.length + alexReply.length) / 3,
+                    providerLabel = "Firebase AI ($candidateModel)",
+                    usedFallback = index > 0
+                )
+
+                return LiveAudioTurnResult(
+                    heardSpeech = heardSpeech && userTranscript.isNotBlank() && alexReply.isNotBlank(),
+                    userTranscript = userTranscript,
+                    alexReply = alexReply,
+                    language = detectedLang
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                lastException = e
+                Log.w(TAG, "Firebase AI audio turn failed on $candidateModel: ${e.message}")
+            }
         }
 
-        val rawJson = response.text ?: throw IllegalStateException("Empty audio understanding response.")
-        val json = JSONObject(rawJson)
-        val heardSpeech = json.optBoolean("heardSpeech", false)
-        val userTranscript = json.optString("userTranscript", "").trim()
-        val alexReply = json.optString("alexReply", "").trim()
-        val langCode = json.optString("languageCode", "EN")
-        val detectedLang = if (userTranscript.isNotNotEmpty()) {
-            LanguageDetector.detectLanguage(userTranscript)
-        } else {
-            AlexLanguage.fromCode(langCode)
-        }
-
-        val elapsed = System.currentTimeMillis() - startMs
-        recordMetric(
-            latencyMs = elapsed,
-            tokensDelta = (userTranscript.length + alexReply.length) / 3,
-            providerLabel = "Firebase AI ($activeModelName)"
-        )
-
-        return LiveAudioTurnResult(
-            heardSpeech = heardSpeech && userTranscript.isNotBlank() && alexReply.isNotBlank(),
-            userTranscript = userTranscript,
-            alexReply = alexReply,
-            language = detectedLang
-        )
+        throw lastException ?: IllegalStateException("All Gemini voice models failed to process audio.")
     }
-
-    private fun String.isNotNotEmpty(): Boolean = this.isNotEmpty()
 
     fun streamChatResponse(
         prompt: String,
@@ -386,73 +429,52 @@ class GeminiBrainService(private val context: Context) {
                 if (reply.isBlank()) {
                     throw IllegalStateException("ALEX received an empty response from Gemini.")
                 }
+                val modelUsed = directApiClient.lastSucceededModel.ifBlank { settings.chatModelName }
                 recordMetric(
                     latencyMs = System.currentTimeMillis() - startMs,
                     tokensDelta = (prompt.length + reply.length) / 4,
-                    providerLabel = "Gemini Direct (${settings.chatModelName})"
+                    providerLabel = "Gemini Direct ($modelUsed)"
                 )
                 emit(reply)
                 return@flow
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
+                Log.w(TAG, "Direct API key chat failed (${e.message}), attempting fallback providers")
                 // Automatic fallback to Groq if configured
                 if (settings.groqApiKey.isNotBlank()) {
-                    val groqFallback = directApiClient.generateGroqCompatibleReply(
-                        groqApiKey = settings.groqApiKey,
-                        prompt = prompt,
-                        historyTurns = historyTurns,
-                        settings = settings
-                    )
-                    recordMetric(
-                        latencyMs = System.currentTimeMillis() - startMs,
-                        tokensDelta = (prompt.length + groqFallback.length) / 4,
-                        providerLabel = "Groq Fallback",
-                        usedFallback = true
-                    )
-                    emit(groqFallback)
-                    return@flow
+                    try {
+                        val groqFallback = directApiClient.generateGroqCompatibleReply(
+                            groqApiKey = settings.groqApiKey,
+                            prompt = prompt,
+                            historyTurns = historyTurns,
+                            settings = settings
+                        )
+                        recordMetric(
+                            latencyMs = System.currentTimeMillis() - startMs,
+                            tokensDelta = (prompt.length + groqFallback.length) / 4,
+                            providerLabel = "Groq Fallback",
+                            usedFallback = true
+                        )
+                        emit(groqFallback)
+                        return@flow
+                    } catch (groqErr: Exception) {
+                        Log.w(TAG, "Groq fallback failed: ${groqErr.message}")
+                    }
                 }
-                throw e
+                // Fall through to Firebase AI multi-model pool so quota exhaustion on custom key never blocks the user
             }
         }
 
-        // 3. Firebase AI Logic Mode (with automatic model switching)
+        // 3. Firebase AI Logic Mode (with multi-model automatic fallback)
         val detectedLanguage = if (settings.preferredLanguage == AlexLanguage.AUTO) {
             LanguageDetector.detectLanguage(prompt)
         } else {
             settings.preferredLanguage
         }
 
-        val targetModelName = if (settings.autoModelSwitchingEnabled && prompt.length > 180) {
-            AlexConfig.REASONING_MODEL
-        } else {
-            AlexConfig.sanitizeModelName(settings.chatModelName, AlexConfig.DEFAULT_CHAT_MODEL)
-        }
-
-        val model = if (
-            targetModelName == AlexConfig.DEFAULT_CHAT_MODEL &&
-            settings.userTitle == AlexConfig.DEFAULT_USER_TITLE &&
-            settings.preferredLanguage == AlexLanguage.AUTO
-        ) {
-            defaultGenerativeModel
-        } else {
-            Firebase.ai.generativeModel(
-                modelName = targetModelName,
-                generationConfig = generationConfig {
-                    temperature = 0.75f
-                },
-                systemInstruction = content {
-                    text(
-                        AlexConfig.buildSystemInstruction(
-                            userTitle = settings.userTitle,
-                            preferredLanguage = detectedLanguage,
-                            voiceName = settings.selectedVoiceId
-                        )
-                    )
-                }
-            )
-        }
+        val preferReasoning = settings.autoModelSwitchingEnabled && prompt.length > 180
+        val candidates = firebaseCandidateModels(settings, preferReasoning = preferReasoning)
 
         val chatHistory = historyTurns
             .takeLast(16)
@@ -462,95 +484,184 @@ class GeminiBrainService(private val context: Context) {
                 content(role) { text(turn.text) }
             }
 
-        val chat = model.startChat(history = chatHistory)
-        val accumulated = StringBuilder()
+        var lastError: Exception? = null
+        for ((index, targetModelName) in candidates.withIndex()) {
+            val accumulated = StringBuilder()
+            try {
+                val model = if (
+                    targetModelName == AlexConfig.DEFAULT_CHAT_MODEL &&
+                    settings.userTitle == AlexConfig.DEFAULT_USER_TITLE &&
+                    settings.preferredLanguage == AlexLanguage.AUTO
+                ) {
+                    defaultGenerativeModel
+                } else {
+                    Firebase.ai.generativeModel(
+                        modelName = targetModelName,
+                        generationConfig = generationConfig {
+                            temperature = 0.75f
+                        },
+                        systemInstruction = content {
+                            text(
+                                AlexConfig.buildSystemInstruction(
+                                    userTitle = settings.userTitle,
+                                    preferredLanguage = detectedLanguage,
+                                    voiceName = settings.selectedVoiceId
+                                )
+                            )
+                        }
+                    )
+                }
 
-        withTimeout(AlexConfig.GENERATION_TIMEOUT_MS) {
-            chat.sendMessageStream(prompt).collect { chunk ->
-                val chunkText = chunk.text.orEmpty()
-                if (chunkText.isNotEmpty()) {
-                    accumulated.append(chunkText)
-                    emit(accumulated.toString())
+                val chat = model.startChat(history = chatHistory)
+
+                withTimeout(AlexConfig.GENERATION_TIMEOUT_MS) {
+                    chat.sendMessageStream(prompt).collect { chunk ->
+                        val chunkText = chunk.text.orEmpty()
+                        if (chunkText.isNotEmpty()) {
+                            accumulated.append(chunkText)
+                            emit(accumulated.toString())
+                        }
+                    }
+                }
+
+                val finalStr = accumulated.toString()
+                if (finalStr.isBlank()) {
+                    throw IllegalStateException("ALEX received an empty response from $targetModelName.")
+                }
+
+                recordMetric(
+                    latencyMs = System.currentTimeMillis() - startMs,
+                    tokensDelta = (prompt.length + finalStr.length) / 4,
+                    providerLabel = "Firebase AI ($targetModelName)",
+                    usedFallback = index > 0
+                )
+                return@flow
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                lastError = e
+                Log.w(TAG, "Firebase AI chat failed on $targetModelName: ${e.message}")
+                if (accumulated.isNotEmpty()) {
+                    return@flow
                 }
             }
         }
 
-        val finalStr = accumulated.toString()
-        if (finalStr.isBlank()) {
-            throw IllegalStateException("ALEX received an empty response from Gemini.")
-        }
-
-        recordMetric(
-            latencyMs = System.currentTimeMillis() - startMs,
-            tokensDelta = (prompt.length + finalStr.length) / 4,
-            providerLabel = "Firebase AI ($targetModelName)"
-        )
+        throw lastError ?: IllegalStateException("All Gemini models failed to respond.")
     }
 
     suspend fun runConnectionDiagnostic(settings: AlexSettings): DiagnosticTestResult {
         val startMs = System.currentTimeMillis()
-        val testedModel = AlexConfig.sanitizeModelName(
-            settings.chatModelName,
-            AlexConfig.DEFAULT_CHAT_MODEL
-        )
+        val requestedModel = settings.liveModelName.ifBlank { settings.chatModelName }
         if (!isNetworkConnected()) {
             return DiagnosticTestResult(
                 success = false,
                 latencyMs = 0L,
-                modelTested = testedModel,
+                modelTested = requestedModel,
                 responseSnippet = "",
                 errorDetail = "Device is offline. Please enable internet access."
             )
         }
 
+        val diagnosticPrompt = "Reply in one short sentence as ALEX greeting ${settings.userTitle} and confirming systems are online."
+
         return try {
-            val text = if (settings.customApiKey.isNotBlank()) {
+            if (settings.customApiKey.isNotBlank()) {
                 refreshDiscoveredModels(settings.customApiKey)
-                withTimeout(AlexConfig.GENERATION_TIMEOUT_MS) {
-                    directApiClient.generateChatReplyWithKey(
-                        apiKey = settings.customApiKey,
-                        prompt = "Reply in one short sentence as ALEX greeting ${settings.userTitle} and confirming systems are online.",
-                        historyTurns = emptyList(),
-                        settings = settings
-                    ).trim()
+                try {
+                    val text = withTimeout(AlexConfig.GENERATION_TIMEOUT_MS) {
+                        directApiClient.generateChatReplyWithKey(
+                            apiKey = settings.customApiKey,
+                            prompt = diagnosticPrompt,
+                            historyTurns = emptyList(),
+                            settings = settings
+                        ).trim()
+                    }
+                    val elapsed = System.currentTimeMillis() - startMs
+                    val actualModel = directApiClient.lastSucceededModel.ifBlank { requestedModel }
+                    val modelLabel = if (actualModel != requestedModel && requestedModel.isNotBlank()) {
+                        "$actualModel (Auto-Selected for $requestedModel • Custom API Key)"
+                    } else {
+                        "$actualModel (Custom API Key)"
+                    }
+                    if (text.isNotEmpty()) {
+                        recordMetric(
+                            latencyMs = elapsed,
+                            tokensDelta = text.length / 3,
+                            providerLabel = "Gemini Direct ($actualModel)",
+                            usedFallback = actualModel != requestedModel
+                        )
+                        return DiagnosticTestResult(
+                            success = true,
+                            latencyMs = elapsed,
+                            modelTested = modelLabel,
+                            responseSnippet = text
+                        )
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    val msg = e.localizedMessage ?: ""
+                    // If the API key itself is invalid (e.g. 400 API_KEY_INVALID), surface that clearly.
+                    // If it's a Free Tier quota error (429), automatically fall back to Firebase AI Logic!
+                    if (msg.contains("API_KEY_INVALID", ignoreCase = true) ||
+                        msg.contains("API key not valid", ignoreCase = true)
+                    ) {
+                        throw e
+                    }
+                    Log.w(TAG, "Custom API key hit quota/limit during diagnostic; falling back to Firebase AI pool: $msg")
                 }
-            } else {
-                val response = withTimeout(AlexConfig.GENERATION_TIMEOUT_MS) {
-                    defaultGenerativeModel.generateContent(
-                        "Reply in one short sentence as ALEX greeting ${settings.userTitle} and confirming systems are online."
-                    )
-                }
-                response.text?.trim().orEmpty()
             }
 
-            val elapsed = System.currentTimeMillis() - startMs
-            if (text.isNotEmpty()) {
-                recordMetric(
-                    latencyMs = elapsed,
-                    tokensDelta = text.length / 3,
-                    providerLabel = if (settings.customApiKey.isNotBlank()) "Gemini Direct" else "Firebase AI"
-                )
-                DiagnosticTestResult(
-                    success = true,
-                    latencyMs = elapsed,
-                    modelTested = if (settings.customApiKey.isNotBlank()) "$testedModel (Custom API Key)" else testedModel,
-                    responseSnippet = text
-                )
-            } else {
-                DiagnosticTestResult(
-                    success = false,
-                    latencyMs = elapsed,
-                    modelTested = testedModel,
-                    responseSnippet = "",
-                    errorDetail = "Model returned an empty diagnostic response."
-                )
+            // Firebase AI Logic multi-model pool
+            var lastFirebaseErr: Exception? = null
+            for (candidateModel in firebaseCandidateModels(settings)) {
+                try {
+                    val model = Firebase.ai.generativeModel(
+                        modelName = candidateModel,
+                        systemInstruction = content {
+                            text(AlexConfig.buildSystemInstruction(userTitle = settings.userTitle))
+                        }
+                    )
+                    val response = withTimeout(AlexConfig.GENERATION_TIMEOUT_MS) {
+                        model.generateContent(diagnosticPrompt)
+                    }
+                    val text = response.text?.trim().orEmpty()
+                    if (text.isNotEmpty()) {
+                        val elapsed = System.currentTimeMillis() - startMs
+                        recordMetric(
+                            latencyMs = elapsed,
+                            tokensDelta = text.length / 3,
+                            providerLabel = "Firebase AI ($candidateModel)"
+                        )
+                        return DiagnosticTestResult(
+                            success = true,
+                            latencyMs = elapsed,
+                            modelTested = candidateModel,
+                            responseSnippet = text
+                        )
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    lastFirebaseErr = e
+                    Log.w(TAG, "Firebase diagnostic failed on $candidateModel: ${e.message}")
+                }
             }
+
+            DiagnosticTestResult(
+                success = false,
+                latencyMs = System.currentTimeMillis() - startMs,
+                modelTested = requestedModel,
+                responseSnippet = "",
+                errorDetail = lastFirebaseErr?.localizedMessage ?: "Model returned an empty diagnostic response."
+            )
         } catch (e: TimeoutCancellationException) {
             Log.e(TAG, "Diagnostic timed out", e)
             DiagnosticTestResult(
                 success = false,
                 latencyMs = System.currentTimeMillis() - startMs,
-                modelTested = testedModel,
+                modelTested = requestedModel,
                 responseSnippet = "",
                 errorDetail = "Diagnostic timed out after 60 seconds."
             )
@@ -561,7 +672,7 @@ class GeminiBrainService(private val context: Context) {
             DiagnosticTestResult(
                 success = false,
                 latencyMs = System.currentTimeMillis() - startMs,
-                modelTested = testedModel,
+                modelTested = requestedModel,
                 responseSnippet = "",
                 errorDetail = e.localizedMessage ?: "Gemini diagnostic call failed."
             )

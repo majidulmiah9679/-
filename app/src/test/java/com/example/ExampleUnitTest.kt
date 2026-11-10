@@ -69,5 +69,21 @@ class ExampleUnitTest {
             "gemini-3.8-flash",
             AlexConfig.sanitizeModelName("gemini-3.8-flash")
         )
+        val expectedModels = listOf(
+            "gemini-3.8-flash",
+            "gemini-3.5-flash-lite",
+            "gemini-2.5-flash-lite",
+            "gemini-2.5-flash",
+            "gemini-2.5-pro",
+            "gemini-2.0-flash",
+            "gemini-2.0-flash-lite",
+            "gemini-4-argon",
+            "gemini-3.1-flash-tts-preview"
+        )
+        expectedModels.forEach { model ->
+            assertEquals(model, AlexConfig.sanitizeModelName(model))
+            assertTrue(AlexConfig.AVAILABLE_LIVE_MODELS.contains(model))
+            assertTrue(AlexConfig.AVAILABLE_CHAT_MODELS.contains(model))
+        }
     }
 }

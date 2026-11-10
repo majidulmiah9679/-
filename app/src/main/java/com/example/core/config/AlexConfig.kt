@@ -99,29 +99,41 @@ object AlexConfig {
     const val DEFAULT_USER_TITLE = "Boss"
     const val APP_VERSION = "3.0.0-PART2-AUTOMATION"
 
-    // Centralized Gemini Multi-Model Configuration
+    // Centralized Gemini Multi-Model Configuration (All models supported with auto-fallback)
     const val DEFAULT_LIVE_MODEL = "gemini-3.8-flash"
     const val FAST_LIVE_MODEL = "gemini-3.5-flash-lite"
     const val DEFAULT_CHAT_MODEL = "gemini-3.8-flash"
     const val FAST_CHAT_MODEL = "gemini-3.5-flash-lite"
     const val REASONING_MODEL = "gemini-4-argon"
+    const val DIRECT_COMPAT_FLASH_LITE_MODEL = "gemini-2.5-flash-lite"
     const val DIRECT_COMPAT_FLASH_MODEL = "gemini-2.5-flash"
     const val DIRECT_COMPAT_PRO_MODEL = "gemini-2.5-pro"
+    const val DIRECT_COMPAT_2_0_FLASH_MODEL = "gemini-2.0-flash"
+    const val DIRECT_COMPAT_2_0_LITE_MODEL = "gemini-2.0-flash-lite"
     const val TTS_MODEL = "gemini-3.1-flash-tts-preview"
 
     val AVAILABLE_LIVE_MODELS = listOf(
         DEFAULT_LIVE_MODEL,
         FAST_LIVE_MODEL,
+        DIRECT_COMPAT_FLASH_LITE_MODEL,
         DIRECT_COMPAT_FLASH_MODEL,
+        DIRECT_COMPAT_PRO_MODEL,
+        DIRECT_COMPAT_2_0_FLASH_MODEL,
+        DIRECT_COMPAT_2_0_LITE_MODEL,
+        REASONING_MODEL,
         TTS_MODEL
     )
 
     val AVAILABLE_CHAT_MODELS = listOf(
         DEFAULT_CHAT_MODEL,
         FAST_CHAT_MODEL,
-        REASONING_MODEL,
+        DIRECT_COMPAT_FLASH_LITE_MODEL,
         DIRECT_COMPAT_FLASH_MODEL,
-        DIRECT_COMPAT_PRO_MODEL
+        DIRECT_COMPAT_PRO_MODEL,
+        DIRECT_COMPAT_2_0_FLASH_MODEL,
+        DIRECT_COMPAT_2_0_LITE_MODEL,
+        REASONING_MODEL,
+        TTS_MODEL
     )
 
     // Audio Configuration Constants for Real-Time Live Voice
@@ -250,7 +262,6 @@ object AlexConfig {
         if (modelName.isNullOrBlank()) return defaultModel
         if (
             modelName.startsWith("gemini-1.") ||
-            modelName.startsWith("gemini-2.0") ||
             modelName.contains("live-preview")
         ) {
             return defaultModel
