@@ -1,0 +1,118 @@
+name: Build ALEX AI Android APK (Native Kotlin + Java)
+
+on:
+  push:
+    branches:
+      - "**"
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  build-android-apk:
+    name: Compile & Package Native Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 1. Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 2. Set up JDK 21 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "21"
+
+      - name: 3. Set up Android SDK & Accept Licenses
+        uses: android-actions/setup-android@v3
+        with:
+          packages: "tools platform-tools build-tools;36.0.0"
+
+      - name: 4. Accept All Android SDK Licenses
+        run: |
+          yes | sdkmanager --licenses || true
+
+      - name: 5. Prepare .env and Debug Keystore for CI Build
+        env:
+          SECRET_GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          # Ensure .env exists for the Secrets Gradle Plugin
+          if [ ! -f ".env" ]; then
+            cp .env.example .env
+          fi
+          if [ -n "$SECRET_GEMINI_API_KEY" ]; then
+            echo "" >> .env
+            echo "GEMINI_API_KEY=$SECRET_GEMINI_API_KEY" >> .env
+          fi
+
+          # Restore debug.keystore from debug.keystore.base64 (or generate if needed)
+          if [ ! -f "debug.keystore" ]; then
+            if [ -f "debug.keystore.base64" ]; then
+              base64 -d debug.keystore.base64 > debug.keystore
+            else
+              keytool -genkeypair -v \
+                -keystore debug.keystore \
+                -storepass android \
+                -alias androiddebugkey \
+                -keypass android \
+                -keyalg RSA \
+                -keysize 2048 \
+                -validity 10000 \
+                -dname "CN=Android Debug,O=Android,C=US"
+            fi
+          fi
+
+      - name: 6. Set up Gradle 9.3.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "9.3.1"
+          cache-read-only: false
+
+      - name: 7. Build Installable Debug APK
+        run: |
+          if [ -f "./gradlew" ]; then
+            chmod +x ./gradlew
+            ./gradlew :app:assembleDebug --no-daemon --stacktrace
+          else
+            gradle :app:assembleDebug --no-daemon --stacktrace
+          fi
+
+      - name: 8. Prepare Clean APK Output Directory
+        run: |
+          mkdir -p dist-apk
+          cp app/build/outputs/apk/debug/app-debug.apk dist-apk/ALEX-AI-v1.0.0-debug.apk
+          ls -lh dist-apk/
+
+      - name: 9. Upload Installable APK to GitHub Actions Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ALEX-AI-Android-APK
+          path: |
+            dist-apk/ALEX-AI-v1.0.0-debug.apk
+            app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 10. Publish APK to GitHub Releases (On Tag or Main Push)
+        if: github.event_name == 'push' && (startsWith(github.ref, 'refs/tags/') || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'latest-apk-build' }}
+          name: "ALEX AI Native Android APK (${{ github.sha }})"
+          body: |
+            ### ALEX AI — Native Kotlin + Java Android APK
+            - **Download APK**: Install `ALEX-AI-v1.0.0-debug.apk` directly on your Android phone (Android 8.0+).
+            - **Manual Gemini API Key**: Open the app → tap **SET API KEY** → paste your `AIzaSy...` key → tap **SAVE & GO ONLINE**.
+          files: |
+            dist-apk/ALEX-AI-v1.0.0-debug.apk
+          prerelease: false
+        continue-on-error: true

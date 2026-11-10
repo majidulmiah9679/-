@@ -54,4 +54,20 @@ class ExampleUnitTest {
         assertTrue(instruction.contains("Hindi"))
         assertTrue(instruction.contains("Aoede"))
     }
+
+    @Test
+    fun `sanitizeModelName upgrades deprecated gemini 2 models to gemini-3_8-flash`() {
+        assertEquals(
+            "gemini-3.8-flash",
+            AlexConfig.sanitizeModelName("gemini-2.0-flash-live-preview-04-09")
+        )
+        assertEquals(
+            "gemini-3.8-flash",
+            AlexConfig.sanitizeModelName("gemini-2.5-flash-live-preview")
+        )
+        assertEquals(
+            "gemini-3.8-flash",
+            AlexConfig.sanitizeModelName("gemini-3.8-flash")
+        )
+    }
 }

@@ -60,13 +60,18 @@ class ExampleRobolectricTest {
     }
 
     @Test
-    fun `app name and AppCheck security initialization succeed`() {
+    fun `app name, AppCheck security, and NativeSystemBridge Java-Kotlin interop succeed`() {
         val appName = context.getString(R.string.app_name)
         assertEquals("Alex AI", appName)
 
         configureAppCheck(context, null)
         val diag = SecurityAuditManager.diagnostics.value
         assertTrue(diag.zeroHardcodedKeysVerified)
+
+        val hwSnapshot = com.example.core.config.NativeSystemBridge.captureHardwareSnapshot(context)
+        assertTrue(hwSnapshot.deviceModel.isNotBlank())
+        assertTrue(hwSnapshot.primaryCpuAbi.isNotBlank())
+        assertTrue(hwSnapshot.toSummaryLine().contains("Android"))
     }
 
     @Test
@@ -94,6 +99,12 @@ class ExampleRobolectricTest {
         audioEngine.flushPlaybackForBargeIn()
         assertFalse(audioEngine.isModelPlayingAudio.value)
         assertEquals(0f, audioEngine.outputAmplitude.value, 0.001f)
+
+        // Verify 44-byte RIFF/WAVE header wrapper for live multimodal audio turns
+        val wavBytes = audioEngine.pcmToWavBytes(pcmBytes, 16000)
+        assertEquals(44 + pcmBytes.size, wavBytes.size)
+        assertEquals("RIFF", String(wavBytes, 0, 4, Charsets.US_ASCII))
+        assertEquals("WAVE", String(wavBytes, 8, 4, Charsets.US_ASCII))
     }
 
     @Test
@@ -188,10 +199,13 @@ class ExampleRobolectricTest {
         composeTestRule.onNodeWithTag("settings_back_button").performClick()
         composeTestRule.waitForIdle()
 
-        // Navigate to API Config Screen and back
-        composeTestRule.onNodeWithTag("nav_api_config_button").performClick()
+        // Navigate to API Config Screen, verify manual API key input and save button, and go back
+        composeTestRule.onNodeWithTag("home_api_key_chip").assertIsDisplayed()
+        composeTestRule.onNodeWithTag("home_api_key_chip").performClick()
         composeTestRule.waitForIdle()
         composeTestRule.onNodeWithTag("api_config_screen").assertIsDisplayed()
+        composeTestRule.onNodeWithTag("manual_api_key_input").assertIsDisplayed()
+        composeTestRule.onNodeWithTag("save_api_key_button").assertIsDisplayed()
         composeTestRule.onNodeWithTag("api_config_back_button").performClick()
         composeTestRule.waitForIdle()
 

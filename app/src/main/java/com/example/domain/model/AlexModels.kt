@@ -71,7 +71,7 @@ data class AlexSettings(
     val speechRate: Float = 1.0f,
     val voicePitch: Float = 1.02f,
     val preferredLanguage: AlexLanguage = AlexLanguage.AUTO,
-    val liveModelName: String = "gemini-2.0-flash-live-preview-04-09",
+    val liveModelName: String = "gemini-3.8-flash",
     val chatModelName: String = "gemini-3.8-flash",
     val saveHistoryEnabled: Boolean = true,
     val autoBargeInEnabled: Boolean = true,
@@ -79,5 +79,6 @@ data class AlexSettings(
     val noiseSuppressionEnabled: Boolean = true,
     val vadSensitivity: Float = 0.55f,
     val speakChatReplies: Boolean = true,
-    val userTitle: String = "Boss"
+    val userTitle: String = "Boss",
+    val customApiKey: String = ""
 )

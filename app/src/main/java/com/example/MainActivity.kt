@@ -230,6 +230,9 @@ fun AlexNavigationHost(
             ApiConfigScreen(
                 settings = settings,
                 diagnosticState = diagnosticState,
+                onSaveCustomApiKey = { key ->
+                    viewModel.saveCustomApiKey(key)
+                },
                 onUpdateModels = { liveModel, chatModel ->
                     viewModel.updateModels(liveModel, chatModel)
                 },

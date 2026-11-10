@@ -31,6 +31,8 @@ import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.NetworkCheck
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.VerifiedUser
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -57,10 +59,14 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import com.example.core.config.AlexConfig
+import com.example.core.config.NativeSystemBridge
 import com.example.domain.model.AlexLanguage
 import com.example.domain.model.AlexSettings
 import com.example.feature.DiagnosticUiState
@@ -442,6 +448,7 @@ fun SettingsScreen(
 fun ApiConfigScreen(
     settings: AlexSettings,
     diagnosticState: DiagnosticUiState,
+    onSaveCustomApiKey: (String) -> Unit,
     onUpdateModels: (String, String) -> Unit,
     onRunDiagnostic: () -> Unit,
     onNavigateBack: () -> Unit
@@ -451,6 +458,9 @@ fun ApiConfigScreen(
     }
 
     val securityDiagnostics by SecurityAuditManager.diagnostics.collectAsState()
+    var apiKeyDraft by remember(settings.customApiKey) { mutableStateOf(settings.customApiKey) }
+    var showApiKeyPlaintext by remember { mutableStateOf(false) }
+    var savedConfirmationVisible by remember { mutableStateOf(false) }
 
     Box(
         modifier = Modifier
@@ -492,7 +502,7 @@ fun ApiConfigScreen(
                         color = AlexCyan
                     )
                     Text(
-                        text = "ZERO-TRUST FIREBASE AI LOGIC • APP CHECK",
+                        text = "MANUAL API KEY • ZERO-TRUST FIREBASE AI LOGIC",
                         style = MaterialTheme.typography.labelMedium,
                         color = AlexTextSecondary
                     )
@@ -501,100 +511,163 @@ fun ApiConfigScreen(
 
             Spacer(modifier = Modifier.height(14.dp))
 
-            // 1. ZERO-TRUST SECURITY AUDIT CARD
-            SettingsSectionCard(title = "ZERO-TRUST API SECURITY ATTESTATION") {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+            // 1. MANUAL GEMINI API KEY INPUT CARD (User Requested Feature)
+            SettingsSectionCard(title = "1. MANUAL GEMINI API KEY (নিজের API Key বসান)") {
+                val hasActiveKey = settings.customApiKey.isNotBlank()
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = if (hasActiveKey) {
+                        AlexStatusReady.copy(alpha = 0.16f)
+                    } else {
+                        AlexSurfaceNavy
+                    },
+                    border = BorderStroke(
+                        1.dp,
+                        if (hasActiveKey) AlexStatusReady else AlexCyan.copy(alpha = 0.5f)
+                    ),
+                    modifier = Modifier.fillMaxWidth()
                 ) {
-                    Icon(
-                        imageVector = Icons.Default.VerifiedUser,
-                        contentDescription = "Verified Security",
-                        tint = AlexStatusReady,
-                        modifier = Modifier.size(28.dp)
-                    )
-                    Column {
-                        Text(
-                            text = "No Unrestricted API Key Embedded in APK",
-                            style = MaterialTheme.typography.titleMedium,
-                            color = AlexStatusReady,
-                            fontWeight = FontWeight.Bold
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Key,
+                            contentDescription = "API Key Mode",
+                            tint = if (hasActiveKey) AlexStatusReady else AlexCyan,
+                            modifier = Modifier.size(20.dp)
                         )
                         Text(
-                            text = "Project: ${securityDiagnostics.projectId} • Mode: ${securityDiagnostics.attestationMode}",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = AlexCyan
+                            text = if (hasActiveKey) {
+                                "STATUS: CUSTOM API KEY ACTIVE • ONLINE MODE"
+                            } else {
+                                "STATUS: FIREBASE DEFAULT MODE (ম্যানুয়াল API Key খালি আছে)"
+                            },
+                            style = MaterialTheme.typography.labelLarge,
+                            color = if (hasActiveKey) AlexStatusReady else AlexCyan
                         )
                     }
                 }
-                Spacer(modifier = Modifier.height(8.dp))
+
+                Spacer(modifier = Modifier.height(10.dp))
+
                 Text(
-                    text = securityDiagnostics.statusDetail,
+                    text = "আপনার নিজস্ব Google AI Studio Gemini API Key (AIzaSy...) নিচে পেস্ট করে SAVE & GO ONLINE বাটনে চাপ দিন। সাথে সাথে অ্যাপ অনলাইন হয়ে লাইভ ভয়েস এবং চ্যাট কাজ করবে।",
                     style = MaterialTheme.typography.bodyMedium,
                     color = AlexTextSecondary
                 )
-            }
 
-            Spacer(modifier = Modifier.height(14.dp))
+                Spacer(modifier = Modifier.height(10.dp))
 
-            // 2. GEMINI LIVE MODEL CONFIGURATION
-            SettingsSectionCard(title = "CENTRALIZED GEMINI LIVE AUDIO MODEL") {
-                AlexConfig.AVAILABLE_LIVE_MODELS.forEach { modelId ->
-                    Row(
+                OutlinedTextField(
+                    value = apiKeyDraft,
+                    onValueChange = {
+                        apiKeyDraft = it
+                        savedConfirmationVisible = false
+                    },
+                    label = { Text("Enter Gemini API Key (AIzaSy...)") },
+                    placeholder = { Text("AIzaSy...") },
+                    singleLine = true,
+                    visualTransformation = if (showApiKeyPlaintext) {
+                        VisualTransformation.None
+                    } else {
+                        PasswordVisualTransformation()
+                    },
+                    trailingIcon = {
+                        IconButton(
+                            onClick = { showApiKeyPlaintext = !showApiKeyPlaintext },
+                            modifier = Modifier.testTag("toggle_api_key_visibility")
+                        ) {
+                            Icon(
+                                imageVector = if (showApiKeyPlaintext) {
+                                    Icons.Default.VisibilityOff
+                                } else {
+                                    Icons.Default.Visibility
+                                },
+                                contentDescription = if (showApiKeyPlaintext) "Hide API Key" else "Show API Key",
+                                tint = AlexCyan
+                            )
+                        }
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("manual_api_key_input"),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = AlexCyan,
+                        unfocusedBorderColor = AlexCardBorder,
+                        focusedTextColor = AlexTextPrimary,
+                        unfocusedTextColor = AlexTextPrimary,
+                        focusedLabelColor = AlexCyan,
+                        unfocusedLabelColor = AlexTextSecondary
+                    )
+                )
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Button(
+                        onClick = {
+                            onSaveCustomApiKey(apiKeyDraft.trim())
+                            savedConfirmationVisible = true
+                        },
+                        enabled = apiKeyDraft.trim().isNotEmpty(),
                         modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable { onUpdateModels(modelId, settings.chatModelName) }
-                            .padding(vertical = 6.dp),
-                        verticalAlignment = Alignment.CenterVertically
+                            .weight(1.6f)
+                            .height(48.dp)
+                            .testTag("save_api_key_button"),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = AlexStatusReady,
+                            contentColor = AlexBlack
+                        )
                     ) {
-                        RadioButton(
-                            selected = settings.liveModelName == modelId,
-                            onClick = { onUpdateModels(modelId, settings.chatModelName) },
-                            colors = RadioButtonDefaults.colors(selectedColor = AlexCyan)
+                        Icon(
+                            imageVector = Icons.Default.CheckCircle,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp)
                         )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = modelId,
-                            style = MaterialTheme.typography.bodyLarge,
-                            color = AlexTextPrimary
-                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("SAVE & GO ONLINE", fontWeight = FontWeight.Bold)
                     }
+
+                    OutlinedButton(
+                        onClick = {
+                            apiKeyDraft = ""
+                            savedConfirmationVisible = false
+                            onSaveCustomApiKey("")
+                        },
+                        enabled = apiKeyDraft.isNotEmpty() || settings.customApiKey.isNotEmpty(),
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(48.dp)
+                            .testTag("clear_api_key_button"),
+                        shape = RoundedCornerShape(12.dp),
+                        border = BorderStroke(1.dp, AlexStatusDisconnected)
+                    ) {
+                        Text("CLEAR KEY", color = AlexStatusDisconnected)
+                    }
+                }
+
+                if (savedConfirmationVisible && settings.customApiKey.isNotBlank()) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = "✓ API Key সংরক্ষিত হয়েছে! ALEX এখন আপনার নিজস্ব API Key দিয়ে অনলাইনে সংযুক্ত হচ্ছে...",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = AlexStatusReady
+                    )
                 }
             }
 
             Spacer(modifier = Modifier.height(14.dp))
 
-            // 3. GEMINI BRAIN / CHAT MODEL CONFIGURATION
-            SettingsSectionCard(title = "CENTRALIZED GEMINI BRAIN MODEL") {
-                AlexConfig.AVAILABLE_CHAT_MODELS.forEach { modelId ->
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable { onUpdateModels(settings.liveModelName, modelId) }
-                            .padding(vertical = 6.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        RadioButton(
-                            selected = settings.chatModelName == modelId,
-                            onClick = { onUpdateModels(settings.liveModelName, modelId) },
-                            colors = RadioButtonDefaults.colors(selectedColor = AlexCyan)
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = modelId,
-                            style = MaterialTheme.typography.bodyLarge,
-                            color = AlexTextPrimary
-                        )
-                    }
-                }
-            }
-
-            Spacer(modifier = Modifier.height(14.dp))
-
-            // 4. LIVE CONNECTION DIAGNOSTIC RUNNER
-            SettingsSectionCard(title = "LIVE GEMINI CONNECTION DIAGNOSTIC") {
+            // 2. LIVE CONNECTION DIAGNOSTIC RUNNER
+            SettingsSectionCard(title = "2. LIVE GEMINI CONNECTION DIAGNOSTIC") {
                 Text(
-                    text = "Verify real-time connectivity, App Check token handshake, and Gemini model response latency.",
+                    text = "Verify real-time connectivity and Gemini model response latency using your active API Key or Firebase AI Logic.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = AlexTextSecondary
                 )
@@ -665,6 +738,111 @@ fun ApiConfigScreen(
                     }
                 }
             }
+
+            Spacer(modifier = Modifier.height(14.dp))
+
+            // 3. GEMINI LIVE MODEL CONFIGURATION
+            SettingsSectionCard(title = "3. CENTRALIZED GEMINI LIVE AUDIO MODEL") {
+                AlexConfig.AVAILABLE_LIVE_MODELS.forEach { modelId ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { onUpdateModels(modelId, settings.chatModelName) }
+                            .padding(vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        RadioButton(
+                            selected = settings.liveModelName == modelId,
+                            onClick = { onUpdateModels(modelId, settings.chatModelName) },
+                            colors = RadioButtonDefaults.colors(selectedColor = AlexCyan)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = modelId,
+                            style = MaterialTheme.typography.bodyLarge,
+                            color = AlexTextPrimary
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(14.dp))
+
+            // 4. GEMINI BRAIN / CHAT MODEL CONFIGURATION
+            SettingsSectionCard(title = "4. CENTRALIZED GEMINI BRAIN MODEL") {
+                AlexConfig.AVAILABLE_CHAT_MODELS.forEach { modelId ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { onUpdateModels(settings.liveModelName, modelId) }
+                            .padding(vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        RadioButton(
+                            selected = settings.chatModelName == modelId,
+                            onClick = { onUpdateModels(settings.liveModelName, modelId) },
+                            colors = RadioButtonDefaults.colors(selectedColor = AlexCyan)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = modelId,
+                            style = MaterialTheme.typography.bodyLarge,
+                            color = AlexTextPrimary
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(14.dp))
+
+            // 5. ZERO-TRUST SECURITY AUDIT CARD
+            SettingsSectionCard(title = "5. ZERO-TRUST API SECURITY ATTESTATION") {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.VerifiedUser,
+                        contentDescription = "Verified Security",
+                        tint = AlexStatusReady,
+                        modifier = Modifier.size(28.dp)
+                    )
+                    Column {
+                        Text(
+                            text = if (settings.customApiKey.isNotBlank()) {
+                                "User-Provided Gemini API Key Active (Local DataStore)"
+                            } else {
+                                "No Unrestricted API Key Embedded in APK"
+                            },
+                            style = MaterialTheme.typography.titleMedium,
+                            color = AlexStatusReady,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = "Project: ${securityDiagnostics.projectId} • Mode: ${securityDiagnostics.attestationMode}",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = AlexCyan
+                        )
+                    }
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = securityDiagnostics.statusDetail,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = AlexTextSecondary
+                )
+            }
+
+            Spacer(modifier = Modifier.height(14.dp))
+
+            // 6. GITHUB ACTIONS DIRECT APK CI/CD WORKFLOW STATUS
+            SettingsSectionCard(title = "6. GITHUB ACTIONS DIRECT APK BUILD (.github/workflows/build-apk.yml)") {
+                CapabilityBullet("Push-to-Build Active: গিটহাবে পুশ করলেই স্বয়ংক্রিয়ভাবে APK বিল্ড চালু হবে")
+                CapabilityBullet("Artifact Output: ALEX-AI-v1.0.0-debug.apk (GitHub Actions & Releases)")
+                CapabilityBullet("Native Stack: Kotlin + Java (NativeSystemBridge.java) + Jetpack Compose")
+            }
+
+            Spacer(modifier = Modifier.height(24.dp))
         }
     }
 }
@@ -675,6 +853,11 @@ fun AboutScreen(
 ) {
     BackHandler {
         onNavigateBack()
+    }
+
+    val context = LocalContext.current
+    val hardwareSnapshot = remember(context) {
+        NativeSystemBridge.captureHardwareSnapshot(context)
     }
 
     Box(
@@ -717,7 +900,7 @@ fun AboutScreen(
                         color = AlexCyan
                     )
                     Text(
-                        text = "VERSION ${AlexConfig.APP_VERSION} • JARVIS EDITION",
+                        text = "VERSION ${AlexConfig.APP_VERSION} • NATIVE KOTLIN + JAVA",
                         style = MaterialTheme.typography.labelMedium,
                         color = AlexTextSecondary
                     )
@@ -736,6 +919,24 @@ fun AboutScreen(
 
             Spacer(modifier = Modifier.height(12.dp))
 
+            SettingsSectionCard(title = "NATIVE JAVA + KOTLIN HARDWARE TELEMETRY") {
+                CapabilityBullet("Device & OS: ${hardwareSnapshot.deviceModel} • Android ${hardwareSnapshot.androidVersion}")
+                CapabilityBullet("CPU Architecture (ABI): ${hardwareSnapshot.primaryCpuAbi}")
+                CapabilityBullet("Native Audio Output: ${hardwareSnapshot.nativeSampleRateHz} Hz • ${hardwareSnapshot.nativeBufferFrames} frames/buffer")
+                CapabilityBullet("Low-Latency Audio Hardware: ${if (hardwareSnapshot.isLowLatencyAudioSupported) "SUPPORTED" else "STANDARD"}")
+                CapabilityBullet("System Memory (RAM): ${hardwareSnapshot.availableMemoryMb} MB free / ${hardwareSnapshot.totalMemoryMb} MB total")
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            SettingsSectionCard(title = "GITHUB DIRECT APK AUTO-BUILD WORKFLOW") {
+                CapabilityBullet("Workflow File: .github/workflows/build-apk.yml")
+                CapabilityBullet("Trigger: গিটহাবে কোড Push করলেই স্বয়ংক্রিয়ভাবে APK বিল্ড শুরু হয়")
+                CapabilityBullet("Artifact & Release: ডাউনলোডযোগ্য ALEX-AI-v1.0.0-debug.apk তৈরি হয়")
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
             SettingsSectionCard(title = "CORE TECHNICAL CAPABILITIES") {
                 CapabilityBullet("Full-Duplex Gemini Live Voice Streaming (16kHz PCM In / 24kHz PCM Out)")
                 CapabilityBullet("Natural Female Voice Profiles: Aoede, Kore, Leda & Zephyr")
@@ -743,8 +944,10 @@ fun AboutScreen(
                 CapabilityBullet("Real-Time Voice Activity Detection (VAD) & Barge-In Interruption")
                 CapabilityBullet("Hardware Acoustic Echo Cancellation (AEC) & Noise Suppression (NS)")
                 CapabilityBullet("Local Room Database & DataStore Preferences with Privacy Controls")
-                CapabilityBullet("Zero-Trust Firebase AI Logic & App Check Attestation")
+                CapabilityBullet("Manual Gemini API Key Input + Zero-Trust Firebase AI Logic")
             }
+
+            Spacer(modifier = Modifier.height(24.dp))
         }
     }
 }

@@ -12,6 +12,7 @@ import android.media.audiofx.AcousticEchoCanceler
 import android.media.audiofx.NoiseSuppressor
 import android.util.Log
 import com.example.core.config.AlexConfig
+import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.ConcurrentLinkedQueue
@@ -73,6 +74,7 @@ class RealTimeAudioEngine(private val context: Context) {
     private var consecutiveSpeechFrames = 0
 
     var onUserBargeInDetected: (() -> Unit)? = null
+    var onVadUtteranceCompleted: (suspend (ByteArray) -> Unit)? = null
 
     fun updateAudioSettings(
         vadSensitivity: Float,
@@ -110,7 +112,6 @@ class RealTimeAudioEngine(private val context: Context) {
         engineScope = scope
 
         try {
-            // Configure AudioManager for full-duplex speakerphone voice call
             val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
             audioManager?.let { am ->
                 am.mode = AudioManager.MODE_IN_COMMUNICATION
@@ -192,11 +193,18 @@ class RealTimeAudioEngine(private val context: Context) {
             record.startRecording()
             track.play()
 
-            // Start continuous Microphone Capture Coroutine
+            // Continuous Microphone Capture + Real-Time VAD Utterance Segmentation
             recordJob = scope.launch {
                 val chunkBytes = ByteArray(1600) // 50ms of 16kHz 16-bit mono PCM
+                val utterancePcmStream = ByteArrayOutputStream()
+                var activeSpeechFramesInUtterance = 0
+                var silenceFramesAfterSpeech = 0
+
                 while (isActive && isRecordingActive.get()) {
                     if (_isMicMuted.value) {
+                        utterancePcmStream.reset()
+                        activeSpeechFramesInUtterance = 0
+                        silenceFramesAfterSpeech = 0
                         delay(40)
                         continue
                     }
@@ -212,15 +220,17 @@ class RealTimeAudioEngine(private val context: Context) {
                         val rms = computeNormalizedRms(validBytes)
                         _inputAmplitude.value = rms
 
-                        // Voice Activity Detection (VAD) threshold scaled by sensitivity
                         val threshold = (0.18f - (vadSensitivity * 0.13f)).coerceIn(0.03f, 0.20f)
                         val isVoiceFrame = rms > threshold
 
                         if (isVoiceFrame) {
                             consecutiveSpeechFrames++
+                            silenceFramesAfterSpeech = 0
+                            activeSpeechFramesInUtterance++
+                            utterancePcmStream.write(validBytes)
+
                             if (consecutiveSpeechFrames >= 2) {
                                 _isUserSpeakingVad.value = true
-                                // Immediate Barge-In support: stop ALEX playback when user speaks
                                 if (autoBargeInEnabled && _isModelPlayingAudio.value && consecutiveSpeechFrames >= 3) {
                                     flushPlaybackForBargeIn()
                                     onUserBargeInDetected?.invoke()
@@ -228,7 +238,42 @@ class RealTimeAudioEngine(private val context: Context) {
                             }
                         } else {
                             consecutiveSpeechFrames = 0
+                            if (activeSpeechFramesInUtterance > 0) {
+                                silenceFramesAfterSpeech++
+                                // Keep trailing 350ms of natural pause in the utterance buffer
+                                if (silenceFramesAfterSpeech <= 7) {
+                                    utterancePcmStream.write(validBytes)
+                                }
+                                // Natural turn end detected after ~800ms of pause following >= 350ms of speech
+                                if (silenceFramesAfterSpeech >= 16) {
+                                    _isUserSpeakingVad.value = false
+                                    if (activeSpeechFramesInUtterance >= 7) {
+                                        val rawPcm = utterancePcmStream.toByteArray()
+                                        utterancePcmStream.reset()
+                                        activeSpeechFramesInUtterance = 0
+                                        silenceFramesAfterSpeech = 0
+                                        val wavBytes = pcmToWavBytes(rawPcm, AlexConfig.INPUT_SAMPLE_RATE_HZ)
+                                        onVadUtteranceCompleted?.invoke(wavBytes)
+                                    } else {
+                                        utterancePcmStream.reset()
+                                        activeSpeechFramesInUtterance = 0
+                                        silenceFramesAfterSpeech = 0
+                                    }
+                                }
+                            } else {
+                                _isUserSpeakingVad.value = false
+                            }
+                        }
+
+                        // Cap single continuous utterance at ~12 seconds to maintain low latency
+                        if (activeSpeechFramesInUtterance >= 240) {
+                            val rawPcm = utterancePcmStream.toByteArray()
+                            utterancePcmStream.reset()
+                            activeSpeechFramesInUtterance = 0
+                            silenceFramesAfterSpeech = 0
                             _isUserSpeakingVad.value = false
+                            val wavBytes = pcmToWavBytes(rawPcm, AlexConfig.INPUT_SAMPLE_RATE_HZ)
+                            onVadUtteranceCompleted?.invoke(wavBytes)
                         }
 
                         if (!_isModelPlayingAudio.value) {
@@ -242,7 +287,7 @@ class RealTimeAudioEngine(private val context: Context) {
                 }
             }
 
-            // Start continuous AudioTrack Playback Coroutine
+            // Continuous AudioTrack Playback Coroutine
             playbackJob = scope.launch {
                 while (isActive && isPlaybackActive.get()) {
                     val nextChunk = playbackQueue.poll()
@@ -271,6 +316,37 @@ class RealTimeAudioEngine(private val context: Context) {
             stopFullDuplexStreaming()
             onAudioError(e.localizedMessage ?: "Failed to initialize real-time audio hardware.")
         }
+    }
+
+    /**
+     * Wraps raw 16-bit mono little-endian PCM bytes in a standard 44-byte RIFF/WAV header.
+     */
+    fun pcmToWavBytes(pcmData: ByteArray, sampleRate: Int = AlexConfig.INPUT_SAMPLE_RATE_HZ): ByteArray {
+        val channels = 1
+        val bitsPerSample = 16
+        val byteRate = sampleRate * channels * (bitsPerSample / 8)
+        val blockAlign = channels * (bitsPerSample / 8)
+        val totalDataLen = pcmData.size + 36
+
+        val header = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN)
+        header.put("RIFF".toByteArray(Charsets.US_ASCII))
+        header.putInt(totalDataLen)
+        header.put("WAVE".toByteArray(Charsets.US_ASCII))
+        header.put("fmt ".toByteArray(Charsets.US_ASCII))
+        header.putInt(16) // PCM chunk size
+        header.putShort(1.toShort()) // AudioFormat = 1 (PCM)
+        header.putShort(channels.toShort())
+        header.putInt(sampleRate)
+        header.putInt(byteRate)
+        header.putShort(blockAlign.toShort())
+        header.putShort(bitsPerSample.toShort())
+        header.put("data".toByteArray(Charsets.US_ASCII))
+        header.putInt(pcmData.size)
+
+        val wavBytes = ByteArray(44 + pcmData.size)
+        System.arraycopy(header.array(), 0, wavBytes, 0, 44)
+        System.arraycopy(pcmData, 0, wavBytes, 44, pcmData.size)
+        return wavBytes
     }
 
     fun enqueueModelAudioChunk(pcmBytes: ByteArray) {

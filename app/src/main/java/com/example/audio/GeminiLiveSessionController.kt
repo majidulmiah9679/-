@@ -11,6 +11,7 @@ import com.example.domain.model.AlexSettings
 import com.example.domain.model.ConversationModality
 import com.example.domain.model.MessageSender
 import com.example.domain.model.TranscriptTurn
+import com.example.network.DirectGeminiLiveWebSocket
 import com.example.network.GeminiBrainService
 import com.google.firebase.ai.type.InlineData
 import com.google.firebase.ai.type.InlineDataPart
@@ -23,6 +24,7 @@ import com.google.firebase.ai.type.LiveSession
 import com.google.firebase.ai.type.PublicPreviewAPI
 import com.google.firebase.ai.type.TextPart
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.cancellation.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -32,6 +34,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 private const val TAG = "GeminiLiveController"
@@ -47,10 +50,12 @@ class GeminiLiveSessionController(
     private val controllerScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
     private var activeSession: LiveSession? = null
+    private var directWebSocket: DirectGeminiLiveWebSocket? = null
     private var receiveJob: Job? = null
     private var statusMonitorJob: Job? = null
     private var activeConversationId: Long? = null
     private var currentSettings: AlexSettings = AlexSettings()
+    private val isProcessingAudioTurn = AtomicBoolean(false)
 
     private val _liveStatus = MutableStateFlow(AlexLiveStatus.READY)
     val liveStatus: StateFlow<AlexLiveStatus> = _liveStatus.asStateFlow()
@@ -87,6 +92,76 @@ class GeminiLiveSessionController(
                 _liveStatus.value = AlexLiveStatus.LISTENING
             }
         }
+
+        audioEngine.onVadUtteranceCompleted = { wavBytes ->
+            // In Real-Time VAD Multimodal Audio Duplex mode (when WebSocket is not active),
+            // send captured spoken utterance WAV directly to Gemini (using custom API key if set, or Firebase AI Logic)!
+            val wsSession = activeSession
+            val directWs = directWebSocket
+            val isAnyWebSocketActive = (wsSession != null && !wsSession.isClosed()) ||
+                (directWs != null && directWs.isSetupDone.get())
+
+            if (!isAnyWebSocketActive &&
+                _isLiveCallActive.value &&
+                !voiceSynthesizer.isSpeaking.value &&
+                isProcessingAudioTurn.compareAndSet(false, true)
+            ) {
+                controllerScope.launch {
+                    try {
+                        _liveStatus.value = AlexLiveStatus.THINKING
+                        val result = brainService.processLiveAudioTurn(
+                            wavBytes = wavBytes,
+                            historyTurns = _liveTranscript.value,
+                            settings = currentSettings
+                        )
+                        if (result.heardSpeech && _isLiveCallActive.value) {
+                            _detectedLanguage.value = result.language
+                            val uId = UUID.randomUUID().toString()
+                            appendOrUpdateTurn(
+                                id = uId,
+                                sender = MessageSender.USER,
+                                text = result.userTranscript,
+                                languageOverride = result.language,
+                                isStreaming = false
+                            )
+                            persistTurnIfEnabled(
+                                sender = MessageSender.USER,
+                                text = result.userTranscript,
+                                wasInterrupted = false
+                            )
+
+                            val aId = UUID.randomUUID().toString()
+                            appendOrUpdateTurn(
+                                id = aId,
+                                sender = MessageSender.ALEX,
+                                text = result.alexReply,
+                                languageOverride = result.language,
+                                isStreaming = false
+                            )
+                            persistTurnIfEnabled(
+                                sender = MessageSender.ALEX,
+                                text = result.alexReply,
+                                wasInterrupted = false
+                            )
+
+                            _liveStatus.value = AlexLiveStatus.SPEAKING
+                            voiceSynthesizer.speak(result.alexReply, result.language)
+                        } else if (_isLiveCallActive.value) {
+                            _liveStatus.value = AlexLiveStatus.LISTENING
+                        }
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Audio turn processing warning: ${e.message}")
+                        if (_isLiveCallActive.value) {
+                            _liveStatus.value = AlexLiveStatus.LISTENING
+                        }
+                    } finally {
+                        isProcessingAudioTurn.set(false)
+                    }
+                }
+            }
+        }
     }
 
     fun startLiveSession(settings: AlexSettings) {
@@ -110,6 +185,8 @@ class GeminiLiveSessionController(
 
         receiveJob?.cancel()
         statusMonitorJob?.cancel()
+        directWebSocket?.close()
+        directWebSocket = null
 
         _errorMessage.value = null
         _liveStatus.value = AlexLiveStatus.CONNECTING
@@ -117,7 +194,7 @@ class GeminiLiveSessionController(
 
         receiveJob = controllerScope.launch {
             try {
-                // Create a conversation session in Room if history saving is enabled
+                // 1. Create a conversation session in Room if history saving is enabled
                 if (settings.saveHistoryEnabled && activeConversationId == null) {
                     val initialLang = if (settings.preferredLanguage == AlexLanguage.AUTO) {
                         AlexLanguage.ENGLISH
@@ -131,27 +208,97 @@ class GeminiLiveSessionController(
                     )
                 }
 
-                // 1. Connect to official Gemini Live API
-                val session = brainService.connectLiveSession(settings)
-                activeSession = session
-
                 // 2. Start Foreground Service indicating active microphone
                 AlexLiveForegroundService.startService(context)
 
-                // 3. Start full-duplex AudioRecord (16kHz) + AudioTrack (24kHz)
+                // 3. Connect via DirectGeminiLiveWebSocket if custom API key is set, else try Firebase LiveSession
+                var wsSession: LiveSession? = null
+                if (settings.customApiKey.isNotBlank()) {
+                    val customWs = DirectGeminiLiveWebSocket(
+                        apiKey = settings.customApiKey,
+                        settings = settings,
+                        onAudioChunkReceived = { pcmBytes ->
+                            _liveStatus.value = AlexLiveStatus.SPEAKING
+                            audioEngine.enqueueModelAudioChunk(pcmBytes)
+                        },
+                        onTextReceived = { textChunk, turnComplete ->
+                            controllerScope.launch {
+                                if (textChunk.isNotBlank()) {
+                                    currentAlexTurnBuffer.append(textChunk)
+                                    val fullText = currentAlexTurnBuffer.toString().trim()
+                                    val lang = LanguageDetector.detectLanguage(fullText)
+                                    _detectedLanguage.value = lang
+                                    appendOrUpdateTurn(
+                                        id = currentAlexTurnId,
+                                        sender = MessageSender.ALEX,
+                                        text = fullText,
+                                        languageOverride = lang,
+                                        isStreaming = !turnComplete
+                                    )
+                                }
+                                if (turnComplete && currentAlexTurnBuffer.isNotEmpty()) {
+                                    val finalizedAlex = currentAlexTurnBuffer.toString().trim()
+                                    appendOrUpdateTurn(
+                                        id = currentAlexTurnId,
+                                        sender = MessageSender.ALEX,
+                                        text = finalizedAlex,
+                                        isStreaming = false
+                                    )
+                                    persistTurnIfEnabled(
+                                        sender = MessageSender.ALEX,
+                                        text = finalizedAlex,
+                                        wasInterrupted = false
+                                    )
+                                    currentAlexTurnBuffer.clear()
+                                    currentAlexTurnId = UUID.randomUUID().toString()
+                                    if (!audioEngine.isModelPlayingAudio.value) {
+                                        _liveStatus.value = AlexLiveStatus.LISTENING
+                                    }
+                                }
+                            }
+                        },
+                        onInterrupted = {
+                            controllerScope.launch {
+                                audioEngine.flushPlaybackForBargeIn()
+                                voiceSynthesizer.stopImmediately()
+                                _bargeInCount.value += 1
+                                _liveStatus.value = AlexLiveStatus.LISTENING
+                            }
+                        },
+                        onSetupComplete = {
+                            controllerScope.launch {
+                                _liveStatus.value = AlexLiveStatus.LISTENING
+                            }
+                        },
+                        onClosedOrFailed = {
+                            directWebSocket = null
+                        }
+                    )
+                    customWs.connect()
+                    directWebSocket = customWs
+                } else {
+                    wsSession = brainService.tryConnectLiveWebSocketSession(settings)
+                    activeSession = wsSession
+                }
+
+                // 4. Start full-duplex AudioRecord (16kHz) + AudioTrack (24kHz) + VAD
                 audioEngine.startFullDuplexStreaming(
                     enableEchoCancellation = settings.echoCancellationEnabled,
                     enableNoiseSuppression = settings.noiseSuppressionEnabled,
                     onPcmChunkCaptured = { pcmBytes ->
-                        try {
+                        val dWs = directWebSocket
+                        if (dWs != null && dWs.isSetupDone.get()) {
+                            dWs.sendPcmAudioChunk(pcmBytes)
+                        } else {
                             val current = activeSession
                             if (current != null && !current.isClosed()) {
-                                current.sendAudioRealtime(
-                                    InlineData(pcmBytes, AlexConfig.AUDIO_MIME_TYPE)
-                                )
+                                try {
+                                    current.sendAudioRealtime(
+                                        InlineData(pcmBytes, AlexConfig.AUDIO_MIME_TYPE)
+                                    )
+                                } catch (_: Exception) {
+                                }
                             }
-                        } catch (e: Exception) {
-                            Log.w(TAG, "Realtime audio frame send warning: ${e.message}")
                         }
                     },
                     onAudioError = { audioErr ->
@@ -164,49 +311,54 @@ class GeminiLiveSessionController(
 
                 _liveStatus.value = AlexLiveStatus.LISTENING
 
-                // 4. Monitor real-time audio states to keep Status HUD synchronized
+                // 5. Monitor real-time audio states to keep Status HUD synchronized
                 startStatusStateMonitor()
 
-                // 5. Trigger ALEX's initial warm female voice greeting
-                val greetingPrompt = when (settings.preferredLanguage) {
-                    AlexLanguage.BANGLA -> "Boss লাইভে যুক্ত হয়েছেন। বাংলায় সংক্ষেপে ও আন্তরিকভাবে Boss-কে স্বাগত জানাও।"
-                    AlexLanguage.HINDI -> "Boss लाइव कॉल पर जुड़ गए हैं। हिंदी में संक्षेप और गर्मजोशी से Boss का स्वागत करें।"
-                    else -> "Boss just connected to the live voice call. Greet Boss warmly in one short, natural sentence as ALEX."
-                }
-                runCatching {
-                    session.send(greetingPrompt)
-                }.onFailure {
-                    // Fallback local greeting if session initial text frame is ignored
-                    val greetingText = LanguageDetector.getLocalizedGreeting(
-                        settings.preferredLanguage,
-                        settings.userTitle
-                    )
-                    appendOrUpdateTurn(
-                        id = UUID.randomUUID().toString(),
-                        sender = MessageSender.ALEX,
-                        text = greetingText,
-                        isStreaming = false
-                    )
+                // 6. Greet Boss using ALEX's warm female voice
+                val greetingText = LanguageDetector.getLocalizedGreeting(
+                    settings.preferredLanguage,
+                    settings.userTitle
+                )
+                appendOrUpdateTurn(
+                    id = UUID.randomUUID().toString(),
+                    sender = MessageSender.ALEX,
+                    text = greetingText,
+                    languageOverride = if (settings.preferredLanguage == AlexLanguage.AUTO) {
+                        AlexLanguage.ENGLISH
+                    } else {
+                        settings.preferredLanguage
+                    },
+                    isStreaming = false
+                )
+                persistTurnIfEnabled(MessageSender.ALEX, greetingText, wasInterrupted = false)
+
+                if (wsSession != null && !wsSession.isClosed()) {
+                    // Collect WebSocket messages if Firebase WebSocket transport is active
+                    voiceSynthesizer.speak(greetingText, settings.preferredLanguage)
+                    try {
+                        wsSession.receive().collect { serverMessage ->
+                            handleServerMessage(serverMessage, wsSession)
+                        }
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        Log.i(TAG, "WebSocket stream switched to VAD Multimodal Audio Duplex: ${e.message}")
+                        activeSession = null
+                    }
+                } else {
+                    // Speak initial greeting via FemaleVoiceSynthesizer
+                    _liveStatus.value = AlexLiveStatus.SPEAKING
                     voiceSynthesizer.speak(greetingText, settings.preferredLanguage)
                 }
 
-                // 6. Collect continuous bidirectional Gemini Live server messages
-                session.receive().collect { serverMessage ->
-                    handleServerMessage(serverMessage, session)
-                }
-
-                // If collect finishes while call was supposed to be active, mark disconnected
-                if (_isLiveCallActive.value) {
-                    _liveStatus.value = AlexLiveStatus.DISCONNECTED
-                    _isLiveCallActive.value = false
-                    _errorMessage.value = "Gemini Live session ended. Tap Reconnect to resume conversation."
-                    audioEngine.stopFullDuplexStreaming()
-                    AlexLiveForegroundService.stopService(context)
+                // Keep live call active until user ends call
+                while (isActive && _isLiveCallActive.value) {
+                    delay(250)
                 }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                Log.e(TAG, "Gemini Live session error", e)
+                Log.e(TAG, "Live session fatal error", e)
                 audioEngine.stopFullDuplexStreaming()
                 AlexLiveForegroundService.stopService(context)
                 _liveStatus.value = AlexLiveStatus.DISCONNECTED
@@ -234,6 +386,11 @@ class GeminiLiveSessionController(
                             )
                         }
                     }
+                    isProcessingAudioTurn.get() -> {
+                        if (_liveStatus.value != AlexLiveStatus.THINKING) {
+                            _liveStatus.value = AlexLiveStatus.THINKING
+                        }
+                    }
                     isUserSpeaking -> {
                         if (_liveStatus.value != AlexLiveStatus.LISTENING) {
                             _liveStatus.value = AlexLiveStatus.LISTENING
@@ -254,13 +411,10 @@ class GeminiLiveSessionController(
     ) {
         when (message) {
             is LiveServerSetupComplete -> {
-                Log.d(TAG, "Gemini Live SetupComplete received.")
                 _liveStatus.value = AlexLiveStatus.LISTENING
             }
             is LiveServerContent -> {
-                // 1. Check Barge-in Interruption
                 if (message.interrupted) {
-                    Log.d(TAG, "Gemini Live signaled barge-in interruption.")
                     audioEngine.flushPlaybackForBargeIn()
                     voiceSynthesizer.stopImmediately()
                     _bargeInCount.value += 1
@@ -284,7 +438,6 @@ class GeminiLiveSessionController(
                     return
                 }
 
-                // 2. Process real-time user input audio transcription
                 val inputTranscript = message.inputTranscription?.text.orEmpty()
                 if (inputTranscript.isNotEmpty()) {
                     currentUserTurnBuffer.append(inputTranscript)
@@ -301,7 +454,6 @@ class GeminiLiveSessionController(
                     _liveStatus.value = AlexLiveStatus.THINKING
                 }
 
-                // 3. Process model parts (PCM audio chunks and/or text)
                 val parts = message.content?.parts.orEmpty()
                 for (part in parts) {
                     when (part) {
@@ -326,10 +478,8 @@ class GeminiLiveSessionController(
                     }
                 }
 
-                // 4. Process output audio transcription (spoken words of ALEX)
                 val outputTranscript = message.outputTranscription?.text.orEmpty()
                 if (outputTranscript.isNotEmpty()) {
-                    // Commit pending user turn if user finished speaking
                     if (currentUserTurnBuffer.isNotEmpty()) {
                         val finalizedUser = currentUserTurnBuffer.toString().trim()
                         appendOrUpdateTurn(
@@ -360,7 +510,6 @@ class GeminiLiveSessionController(
                     )
                 }
 
-                // 5. Handle Turn Complete
                 if (message.turnComplete) {
                     if (currentUserTurnBuffer.isNotEmpty()) {
                         val finalizedUser = currentUserTurnBuffer.toString().trim()
@@ -411,20 +560,26 @@ class GeminiLiveSessionController(
                 }
             }
             is LiveServerGoAway -> {
-                Log.w(TAG, "Gemini Live ServerGoAway received; reconnecting automatically...")
-                reconnectLiveSession()
+                activeSession = null
             }
         }
     }
 
+    fun syncSettings(settings: AlexSettings) {
+        currentSettings = settings
+    }
+
     /**
-     * Allows sending a live utterance or quick voice prompt directly into the active Live session
-     * (or via hybrid streaming voice if the user triggers a quick voice prompt).
+     * Allows sending a live utterance or quick voice prompt directly into the active Live session.
      */
-    fun sendVoicePromptInLiveSession(promptText: String) {
+    fun sendVoicePromptInLiveSession(promptText: String, latestSettings: AlexSettings? = null) {
+        if (latestSettings != null) {
+            currentSettings = latestSettings
+        }
         val clean = promptText.trim()
         if (clean.isEmpty()) return
 
+        voiceSynthesizer.stopImmediately()
         val lang = LanguageDetector.detectLanguage(clean)
         _detectedLanguage.value = lang
 
@@ -439,29 +594,39 @@ class GeminiLiveSessionController(
 
         controllerScope.launch {
             persistTurnIfEnabled(MessageSender.USER, clean, wasInterrupted = false)
+            val dWs = directWebSocket
             val session = activeSession
-            if (session != null && !session.isClosed() && _isLiveCallActive.value) {
+            if (dWs != null && dWs.isSetupDone.get() && _isLiveCallActive.value) {
+                try {
+                    _liveStatus.value = AlexLiveStatus.THINKING
+                    dWs.sendClientText(clean)
+                } catch (_: Exception) {
+                    directWebSocket = null
+                    speakWithStreamingBrain(clean)
+                }
+            } else if (session != null && !session.isClosed() && _isLiveCallActive.value) {
                 try {
                     _liveStatus.value = AlexLiveStatus.THINKING
                     session.send(clean)
-                } catch (e: Exception) {
-                    Log.w(TAG, "LiveSession.send fallback to streaming brain: ${e.message}")
-                    speakWithStreamingFallback(clean)
+                } catch (_: Exception) {
+                    activeSession = null
+                    speakWithStreamingBrain(clean)
                 }
             } else {
-                speakWithStreamingFallback(clean)
+                speakWithStreamingBrain(clean)
             }
         }
     }
 
-    private suspend fun speakWithStreamingFallback(promptText: String) {
+    private suspend fun speakWithStreamingBrain(promptText: String) {
         val alexTurnId = UUID.randomUUID().toString()
+        val previousStatus = _liveStatus.value
         _liveStatus.value = AlexLiveStatus.THINKING
         var finalReply = ""
         try {
             brainService.streamChatResponse(
                 prompt = promptText,
-                historyTurns = _liveTranscript.value,
+                historyTurns = _liveTranscript.value.dropLast(1),
                 settings = currentSettings
             ).collect { accumulated ->
                 finalReply = accumulated
@@ -485,12 +650,17 @@ class GeminiLiveSessionController(
                 persistTurnIfEnabled(MessageSender.ALEX, finalReply, wasInterrupted = false)
                 _liveStatus.value = AlexLiveStatus.SPEAKING
                 voiceSynthesizer.speak(finalReply, replyLang)
+                if (!_isLiveCallActive.value && previousStatus == AlexLiveStatus.READY) {
+                    _liveStatus.value = AlexLiveStatus.READY
+                }
             }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             _errorMessage.value = buildFriendlyErrorMessage(e)
-            _liveStatus.value = AlexLiveStatus.DISCONNECTED
+            if (!_isLiveCallActive.value) {
+                _liveStatus.value = AlexLiveStatus.DISCONNECTED
+            }
         }
     }
 
@@ -501,10 +671,14 @@ class GeminiLiveSessionController(
 
     fun endLiveSession(keepTranscript: Boolean = true) {
         _isLiveCallActive.value = false
+        isProcessingAudioTurn.set(false)
         receiveJob?.cancel()
         statusMonitorJob?.cancel()
         receiveJob = null
         statusMonitorJob = null
+
+        directWebSocket?.close()
+        directWebSocket = null
 
         val sessionToClose = activeSession
         activeSession = null
@@ -591,7 +765,7 @@ class GeminiLiveSessionController(
                 "Gemini API quota limit reached. Please wait a moment and tap Reconnect."
             raw.contains("network", ignoreCase = true) || raw.contains("Unable to resolve host", ignoreCase = true) ->
                 "Network connection lost. Check your internet connection and tap Reconnect."
-            else -> "Live connection interrupted: $raw"
+            else -> "Live connection error: $raw"
         }
     }
 }

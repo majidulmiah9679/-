@@ -120,7 +120,7 @@ class AlexViewModel(
     }
 
     fun sendLiveVoiceQuickPrompt(prompt: String) {
-        container.liveSessionController.sendVoicePromptInLiveSession(prompt)
+        container.liveSessionController.sendVoicePromptInLiveSession(prompt, settings.value)
     }
 
     fun clearLiveError() {
@@ -366,7 +366,24 @@ class AlexViewModel(
         }
     }
 
-    // ---- API DIAGNOSTICS ----
+    // ---- MANUAL API KEY & DIAGNOSTICS ----
+
+    fun saveCustomApiKey(apiKey: String) {
+        val clean = apiKey.trim()
+        viewModelScope.launch {
+            container.preferencesRepository.updateCustomApiKey(clean)
+            val updatedSettings = settings.value.copy(customApiKey = clean)
+            container.liveSessionController.syncSettings(updatedSettings)
+            container.liveSessionController.clearError()
+            if (clean.isNotBlank()) {
+                _diagnosticState.value = DiagnosticUiState.Running
+                val result = container.geminiBrainService.runConnectionDiagnostic(updatedSettings)
+                _diagnosticState.value = DiagnosticUiState.Completed(result)
+            } else {
+                _diagnosticState.value = DiagnosticUiState.Idle
+            }
+        }
+    }
 
     fun runGeminiDiagnosticTest() {
         viewModelScope.launch {

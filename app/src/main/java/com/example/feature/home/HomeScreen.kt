@@ -320,11 +320,50 @@ fun HomeScreen(
 
             Spacer(modifier = Modifier.height(8.dp))
 
-            // 2. STATUS INDICATOR BADGE (READY / LISTENING / THINKING / SPEAKING / CONNECTING / DISCONNECTED)
-            AlexStatusBadge(
-                status = liveStatus,
-                isMicMuted = isMicMuted
-            )
+            // 2. STATUS INDICATOR BADGE + QUICK MANUAL API KEY BUTTON
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                AlexStatusBadge(
+                    status = liveStatus,
+                    isMicMuted = isMicMuted
+                )
+
+                Surface(
+                    modifier = Modifier
+                        .clickable { onNavigateToApiConfig() }
+                        .testTag("home_api_key_chip"),
+                    shape = RoundedCornerShape(50),
+                    color = if (settings.customApiKey.isNotBlank()) {
+                        AlexStatusReady.copy(alpha = 0.18f)
+                    } else {
+                        AlexCardNavy
+                    },
+                    border = BorderStroke(
+                        1.dp,
+                        if (settings.customApiKey.isNotBlank()) AlexStatusReady else AlexCyan
+                    )
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Key,
+                            contentDescription = "Configure Gemini API Key",
+                            tint = if (settings.customApiKey.isNotBlank()) AlexStatusReady else AlexCyan,
+                            modifier = Modifier.size(14.dp)
+                        )
+                        Text(
+                            text = if (settings.customApiKey.isNotBlank()) "API KEY: ONLINE" else "SET API KEY",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = if (settings.customApiKey.isNotBlank()) AlexStatusReady else AlexCyan
+                        )
+                    }
+                }
+            }
 
             // 3. ERROR OR PERMISSION BANNER WITH RECONNECT ACTION
             if (errorMessage != null || permissionDeniedBanner) {

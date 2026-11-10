@@ -6,6 +6,7 @@ import android.net.NetworkCapabilities
 import android.os.BatteryManager
 import android.util.Log
 import com.example.core.config.AlexConfig
+import com.example.core.config.NativeSystemBridge
 import com.example.domain.language.LanguageDetector
 import com.example.domain.model.AlexLanguage
 import com.example.domain.model.AlexSettings
@@ -37,6 +38,7 @@ import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.withTimeout
+import org.json.JSONObject
 
 private const val TAG = "GeminiBrainService"
 
@@ -48,7 +50,16 @@ data class DiagnosticTestResult(
     val errorDetail: String? = null
 )
 
+data class LiveAudioTurnResult(
+    val heardSpeech: Boolean,
+    val userTranscript: String,
+    val alexReply: String,
+    val language: AlexLanguage
+)
+
 class GeminiBrainService(private val context: Context) {
+
+    private val directApiClient = DirectGeminiApiClient()
 
     // Default generative model lazily initialized per Firebase AI Logic best practices
     private val defaultGenerativeModel: GenerativeModel by lazy {
@@ -59,6 +70,25 @@ class GeminiBrainService(private val context: Context) {
             }
         )
     }
+
+    // Structured JSON schema for real-time multimodal voice turn understanding & reply generation
+    private val liveAudioTurnSchema = Schema.obj(
+        properties = mapOf(
+            "heardSpeech" to Schema.boolean(
+                description = "True if intelligible human speech in Bangla, English, or Hindi was heard in the audio clip; false if only silence or background noise."
+            ),
+            "userTranscript" to Schema.string(
+                description = "Accurate transcript of what the user said in its original script (বাংলা for Bangla, English for English, हिन्दी for Hindi)."
+            ),
+            "alexReply" to Schema.string(
+                description = "ALEX's natural, warm, human-like spoken response in the exact same language as the user, addressing the user as Boss."
+            ),
+            "languageCode" to Schema.enumeration(
+                values = listOf("BN", "EN", "HI"),
+                description = "Detected language code: BN for Bangla, EN for English, HI for Hindi."
+            )
+        )
+    )
 
     fun isNetworkConnected(): Boolean {
         val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
@@ -105,7 +135,8 @@ class GeminiBrainService(private val context: Context) {
                 val bm = context.getSystemService(Context.BATTERY_SERVICE) as? BatteryManager
                 val batteryPct = bm?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY) ?: 100
                 val online = isNetworkConnected()
-                "[Tool Result: getDeviceTelemetry] batteryPercentage=$batteryPct%, networkOnline=$online"
+                val hwSnapshot = NativeSystemBridge.captureHardwareSnapshot(context).toSummaryLine()
+                "[Tool Result: getDeviceTelemetry] batteryPercentage=$batteryPct%, networkOnline=$online, hardware=$hwSnapshot"
             }
             "getLanguageCapabilities" -> {
                 "[Tool Result: getLanguageCapabilities] supportedLanguages=Bangla (বাংলা), English, Hindi (हिन्दी)"
@@ -117,14 +148,23 @@ class GeminiBrainService(private val context: Context) {
     }
 
     /**
-     * Connects to the official Gemini Live API using Firebase AI Logic (`Firebase.ai.liveModel`)
-     * for real-time full-duplex audio input and natural female voice audio output.
+     * Attempts to connect to the Gemini Live WebSocket API (`Firebase.ai.liveModel`).
+     * Returns null if a custom API key is set (handled by DirectGeminiLiveWebSocket) or if the backend channel is unavailable.
      */
     @OptIn(PublicPreviewAPI::class)
-    suspend fun connectLiveSession(settings: AlexSettings): LiveSession {
+    suspend fun tryConnectLiveWebSocketSession(settings: AlexSettings): LiveSession? {
         if (!isNetworkConnected()) {
             throw IllegalStateException("No internet connection detected. Please check Wi-Fi or mobile data.")
         }
+        if (settings.customApiKey.isNotBlank()) {
+            // DirectGeminiLiveWebSocket is used instead when a manual API key is configured
+            return null
+        }
+
+        val sanitizedLiveModel = AlexConfig.sanitizeModelName(
+            settings.liveModelName,
+            AlexConfig.DEFAULT_LIVE_MODEL
+        )
 
         val systemInstructionContent: Content = content {
             text(
@@ -144,21 +184,124 @@ class GeminiBrainService(private val context: Context) {
             temperature = 0.8f
         }
 
-        val liveModel: LiveGenerativeModel = Firebase.ai.liveModel(
-            modelName = settings.liveModelName,
-            generationConfig = liveConfig,
-            tools = buildAssistantTools(),
-            systemInstruction = systemInstructionContent
-        )
-
-        return withTimeout(30_000L) {
-            liveModel.connect()
+        return try {
+            val liveModel: LiveGenerativeModel = Firebase.ai.liveModel(
+                modelName = sanitizedLiveModel,
+                generationConfig = liveConfig,
+                tools = buildAssistantTools(),
+                systemInstruction = systemInstructionContent
+            )
+            withTimeout(6_000L) {
+                liveModel.connect()
+            }
+        } catch (e: CancellationException) {
+            if (e is TimeoutCancellationException) {
+                Log.i(TAG, "Live WebSocket handshake timed out; using Real-Time VAD Multimodal Audio Duplex.")
+                null
+            } else {
+                throw e
+            }
+        } catch (e: Exception) {
+            Log.i(TAG, "Live WebSocket unavailable (${e.javaClass.simpleName}); using Real-Time VAD Multimodal Audio Duplex.")
+            null
         }
     }
 
     /**
-     * Streams a contextual, multi-turn conversational response from Gemini (`gemini-3.8-flash` by default)
-     * with a realistic 60-second timeout window and transparent error handling.
+     * Processes a captured 16kHz WAV voice utterance from the user in real time using either the user's
+     * manual Gemini API Key (`DirectGeminiApiClient`) or Firebase AI Logic (`gemini-3.8-flash`).
+     */
+    suspend fun processLiveAudioTurn(
+        wavBytes: ByteArray,
+        historyTurns: List<TranscriptTurn>,
+        settings: AlexSettings
+    ): LiveAudioTurnResult {
+        if (!isNetworkConnected()) {
+            throw IllegalStateException("No internet connection. Please reconnect and try again.")
+        }
+
+        if (settings.customApiKey.isNotBlank()) {
+            return directApiClient.processLiveAudioTurnWithKey(
+                apiKey = settings.customApiKey,
+                wavBytes = wavBytes,
+                historyTurns = historyTurns,
+                settings = settings
+            )
+        }
+
+        val activeModelName = AlexConfig.sanitizeModelName(
+            settings.chatModelName,
+            AlexConfig.DEFAULT_CHAT_MODEL
+        )
+
+        val recentContext = historyTurns
+            .takeLast(8)
+            .joinToString("\n") { turn ->
+                val speaker = if (turn.sender == MessageSender.USER) settings.userTitle else "ALEX"
+                "$speaker: ${turn.text}"
+            }
+
+        val multimodalAudioModel = Firebase.ai.generativeModel(
+            modelName = activeModelName,
+            generationConfig = generationConfig {
+                responseMimeType = "application/json"
+                responseSchema = liveAudioTurnSchema
+                temperature = 0.75f
+            },
+            systemInstruction = content {
+                text(
+                    AlexConfig.buildSystemInstruction(
+                        userTitle = settings.userTitle,
+                        preferredLanguage = settings.preferredLanguage,
+                        voiceName = settings.selectedVoiceId
+                    )
+                )
+            }
+        )
+
+        val response = withTimeout(AlexConfig.GENERATION_TIMEOUT_MS) {
+            multimodalAudioModel.generateContent(
+                content {
+                    inlineData(wavBytes, AlexConfig.AUDIO_WAV_MIME_TYPE)
+                    text(
+                        buildString {
+                            append("Listen to this live voice audio from ${settings.userTitle}. ")
+                            append("If intelligible speech is present in Bangla (বাংলা), English, or Hindi (हिन्दी), ")
+                            append("transcribe it accurately and provide ALEX's natural spoken response in the same language. ")
+                            if (recentContext.isNotBlank()) {
+                                append("\nRecent conversation context:\n$recentContext")
+                            }
+                        }
+                    )
+                }
+            )
+        }
+
+        val rawJson = response.text ?: throw IllegalStateException("Empty audio understanding response.")
+        val json = JSONObject(rawJson)
+        val heardSpeech = json.optBoolean("heardSpeech", false)
+        val userTranscript = json.optString("userTranscript", "").trim()
+        val alexReply = json.optString("alexReply", "").trim()
+        val langCode = json.optString("languageCode", "EN")
+        val detectedLang = if (userTranscript.isNotNotEmpty()) {
+            LanguageDetector.detectLanguage(userTranscript)
+        } else {
+            AlexLanguage.fromCode(langCode)
+        }
+
+        return LiveAudioTurnResult(
+            heardSpeech = heardSpeech && userTranscript.isNotBlank() && alexReply.isNotBlank(),
+            userTranscript = userTranscript,
+            alexReply = alexReply,
+            language = detectedLang
+        )
+    }
+
+    private fun String.isNotNotEmpty(): Boolean = this.isNotEmpty()
+
+    /**
+     * Streams a contextual, multi-turn conversational response from Gemini (`DirectGeminiApiClient` when
+     * a manual API key is set, or `Firebase.ai` by default) with a 60-second timeout window.
      */
     fun streamChatResponse(
         prompt: String,
@@ -169,21 +312,42 @@ class GeminiBrainService(private val context: Context) {
             throw IllegalStateException("No internet connection. Please reconnect and try again.")
         }
 
+        if (settings.customApiKey.isNotBlank()) {
+            val reply = withTimeout(AlexConfig.GENERATION_TIMEOUT_MS) {
+                directApiClient.generateChatReplyWithKey(
+                    apiKey = settings.customApiKey,
+                    prompt = prompt,
+                    historyTurns = historyTurns,
+                    settings = settings
+                )
+            }
+            if (reply.isBlank()) {
+                throw IllegalStateException("ALEX received an empty response from Gemini.")
+            }
+            emit(reply)
+            return@flow
+        }
+
         val detectedLanguage = if (settings.preferredLanguage == AlexLanguage.AUTO) {
             LanguageDetector.detectLanguage(prompt)
         } else {
             settings.preferredLanguage
         }
 
+        val sanitizedChatModel = AlexConfig.sanitizeModelName(
+            settings.chatModelName,
+            AlexConfig.DEFAULT_CHAT_MODEL
+        )
+
         val model = if (
-            settings.chatModelName == AlexConfig.DEFAULT_CHAT_MODEL &&
+            sanitizedChatModel == AlexConfig.DEFAULT_CHAT_MODEL &&
             settings.userTitle == AlexConfig.DEFAULT_USER_TITLE &&
             settings.preferredLanguage == AlexLanguage.AUTO
         ) {
             defaultGenerativeModel
         } else {
             Firebase.ai.generativeModel(
-                modelName = settings.chatModelName,
+                modelName = sanitizedChatModel,
                 generationConfig = generationConfig {
                     temperature = 0.75f
                 },
@@ -226,40 +390,57 @@ class GeminiBrainService(private val context: Context) {
     }
 
     /**
-     * Runs a live diagnostic verification call against Gemini via Firebase AI Logic + App Check.
+     * Runs a live diagnostic verification call against Gemini using either the user's manual API Key
+     * (`DirectGeminiApiClient`) or Firebase AI Logic + App Check.
      */
     suspend fun runConnectionDiagnostic(settings: AlexSettings): DiagnosticTestResult {
         val startMs = System.currentTimeMillis()
+        val testedModel = AlexConfig.sanitizeModelName(
+            settings.chatModelName,
+            AlexConfig.DEFAULT_CHAT_MODEL
+        )
         if (!isNetworkConnected()) {
             return DiagnosticTestResult(
                 success = false,
                 latencyMs = 0L,
-                modelTested = settings.chatModelName,
+                modelTested = testedModel,
                 responseSnippet = "",
                 errorDetail = "Device is offline. Please enable internet access."
             )
         }
 
         return try {
-            val response = withTimeout(AlexConfig.GENERATION_TIMEOUT_MS) {
-                defaultGenerativeModel.generateContent(
-                    "Reply in one short sentence as ALEX greeting ${settings.userTitle} and confirming systems are online."
-                )
+            val text = if (settings.customApiKey.isNotBlank()) {
+                withTimeout(AlexConfig.GENERATION_TIMEOUT_MS) {
+                    directApiClient.generateChatReplyWithKey(
+                        apiKey = settings.customApiKey,
+                        prompt = "Reply in one short sentence as ALEX greeting ${settings.userTitle} and confirming systems are online.",
+                        historyTurns = emptyList(),
+                        settings = settings
+                    ).trim()
+                }
+            } else {
+                val response = withTimeout(AlexConfig.GENERATION_TIMEOUT_MS) {
+                    defaultGenerativeModel.generateContent(
+                        "Reply in one short sentence as ALEX greeting ${settings.userTitle} and confirming systems are online."
+                    )
+                }
+                response.text?.trim().orEmpty()
             }
+
             val elapsed = System.currentTimeMillis() - startMs
-            val text = response.text?.trim().orEmpty()
             if (text.isNotEmpty()) {
                 DiagnosticTestResult(
                     success = true,
                     latencyMs = elapsed,
-                    modelTested = settings.chatModelName,
+                    modelTested = if (settings.customApiKey.isNotBlank()) "$testedModel (Custom API Key)" else testedModel,
                     responseSnippet = text
                 )
             } else {
                 DiagnosticTestResult(
                     success = false,
                     latencyMs = elapsed,
-                    modelTested = settings.chatModelName,
+                    modelTested = testedModel,
                     responseSnippet = "",
                     errorDetail = "Model returned an empty diagnostic response."
                 )
@@ -269,7 +450,7 @@ class GeminiBrainService(private val context: Context) {
             DiagnosticTestResult(
                 success = false,
                 latencyMs = System.currentTimeMillis() - startMs,
-                modelTested = settings.chatModelName,
+                modelTested = testedModel,
                 responseSnippet = "",
                 errorDetail = "Diagnostic timed out after 60 seconds."
             )
@@ -280,7 +461,7 @@ class GeminiBrainService(private val context: Context) {
             DiagnosticTestResult(
                 success = false,
                 latencyMs = System.currentTimeMillis() - startMs,
-                modelTested = settings.chatModelName,
+                modelTested = testedModel,
                 responseSnippet = "",
                 errorDetail = e.localizedMessage ?: "Gemini diagnostic call failed."
             )

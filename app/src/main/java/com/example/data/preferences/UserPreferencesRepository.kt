@@ -35,6 +35,7 @@ class UserPreferencesRepository(private val context: Context) {
         val VAD_SENSITIVITY = floatPreferencesKey("vad_sensitivity")
         val SPEAK_CHAT_REPLIES = booleanPreferencesKey("speak_chat_replies")
         val USER_TITLE = stringPreferencesKey("user_title")
+        val CUSTOM_API_KEY = stringPreferencesKey("custom_gemini_api_key")
     }
 
     val settingsFlow: Flow<AlexSettings> = context.alexDataStore.data.map { prefs ->
@@ -44,15 +45,22 @@ class UserPreferencesRepository(private val context: Context) {
             speechRate = prefs[Keys.SPECH_RATE_FALLBACK] ?: prefs[Keys.SPEECH_RATE] ?: 1.0f,
             voicePitch = prefs[Keys.VOICE_PITCH] ?: 1.02f,
             preferredLanguage = AlexLanguage.fromCode(prefs[Keys.PREFERRED_LANGUAGE] ?: "AUTO"),
-            liveModelName = prefs[Keys.LIVE_MODEL_NAME] ?: AlexConfig.DEFAULT_LIVE_MODEL,
-            chatModelName = prefs[Keys.CHAT_MODEL_NAME] ?: AlexConfig.DEFAULT_CHAT_MODEL,
+            liveModelName = AlexConfig.sanitizeModelName(
+                prefs[Keys.LIVE_MODEL_NAME],
+                AlexConfig.DEFAULT_LIVE_MODEL
+            ),
+            chatModelName = AlexConfig.sanitizeModelName(
+                prefs[Keys.CHAT_MODEL_NAME],
+                AlexConfig.DEFAULT_CHAT_MODEL
+            ),
             saveHistoryEnabled = prefs[Keys.SAVE_HISTORY_ENABLED] ?: true,
             autoBargeInEnabled = prefs[Keys.AUTO_BARGE_IN_ENABLED] ?: true,
             echoCancellationEnabled = prefs[Keys.ECHO_CANCELLATION_ENABLED] ?: true,
             noiseSuppressionEnabled = prefs[Keys.NOISE_SUPPRESSION_ENABLED] ?: true,
             vadSensitivity = prefs[Keys.VAD_SENSITIVITY] ?: 0.55f,
             speakChatReplies = prefs[Keys.SPEAK_CHAT_REPLIES] ?: true,
-            userTitle = prefs[Keys.USER_TITLE] ?: AlexConfig.DEFAULT_USER_TITLE
+            userTitle = prefs[Keys.USER_TITLE] ?: AlexConfig.DEFAULT_USER_TITLE,
+            customApiKey = prefs[Keys.CUSTOM_API_KEY]?.trim().orEmpty()
         )
     }
 
@@ -60,6 +68,12 @@ class UserPreferencesRepository(private val context: Context) {
 
     suspend fun setOnboardingCompleted(completed: Boolean) {
         context.alexDataStore.edit { it[Keys.HAS_COMPLETED_ONBOARDING] = completed }
+    }
+
+    suspend fun updateCustomApiKey(apiKey: String) {
+        context.alexDataStore.edit { prefs ->
+            prefs[Keys.CUSTOM_API_KEY] = apiKey.trim()
+        }
     }
 
     suspend fun updateVoiceProfile(voiceId: String, speechRate: Float, pitch: Float) {

@@ -1,16 +1,106 @@
 package com.example.core.config
 
+import android.app.ActivityManager
+import android.content.Context
+import android.content.pm.PackageManager
+import android.media.AudioManager
+import android.os.Build
 import com.example.domain.model.AlexLanguage
 import com.example.domain.model.FemaleVoiceOption
+import java.util.Locale
+
+object NativeSystemBridge {
+
+    data class HardwareSnapshot(
+        val deviceModel: String,
+        val androidVersion: String,
+        val primaryCpuAbi: String,
+        val isLowLatencyAudioSupported: Boolean,
+        val isProAudioSupported: Boolean,
+        val nativeSampleRateHz: String,
+        val nativeBufferFrames: String,
+        val availableMemoryMb: Long,
+        val totalMemoryMb: Long
+    ) {
+        fun toSummaryLine(): String {
+            return String.format(
+                Locale.US,
+                "%s • Android %s (%s) • Audio %s Hz / %s frames • RAM %d/%d MB",
+                deviceModel,
+                androidVersion,
+                primaryCpuAbi,
+                nativeSampleRateHz,
+                nativeBufferFrames,
+                availableMemoryMb,
+                totalMemoryMb
+            )
+        }
+    }
+
+    @JvmStatic
+    fun captureHardwareSnapshot(context: Context): HardwareSnapshot {
+        val manufacturer = Build.MANUFACTURER ?: "Android"
+        val model = Build.MODEL ?: "Device"
+        val deviceModel = "$manufacturer $model".trim()
+        val androidVer = if (Build.VERSION.RELEASE != null) {
+            "${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})"
+        } else {
+            "API ${Build.VERSION.SDK_INT}"
+        }
+
+        val abis = Build.SUPPORTED_ABIS
+        val primaryAbi = if (!abis.isNullOrEmpty()) abis[0] else "arm64-v8a"
+
+        val pm = context.packageManager
+        val lowLatency = pm != null && pm.hasSystemFeature(PackageManager.FEATURE_AUDIO_LOW_LATENCY)
+        val proAudio = pm != null && pm.hasSystemFeature(PackageManager.FEATURE_AUDIO_PRO)
+
+        var sampleRate = "24000"
+        var framesPerBuffer = "256"
+        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        if (audioManager != null) {
+            val srProp = audioManager.getProperty(AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE)
+            val fpProp = audioManager.getProperty(AudioManager.PROPERTY_OUTPUT_FRAMES_PER_BUFFER)
+            if (!srProp.isNullOrBlank()) {
+                sampleRate = srProp.trim()
+            }
+            if (!fpProp.isNullOrBlank()) {
+                framesPerBuffer = fpProp.trim()
+            }
+        }
+
+        var availMb = 0L
+        var totalMb = 0L
+        val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+        if (am != null) {
+            val memInfo = ActivityManager.MemoryInfo()
+            am.getMemoryInfo(memInfo)
+            availMb = memInfo.availMem / (1024L * 1024L)
+            totalMb = memInfo.totalMem / (1024L * 1024L)
+        }
+
+        return HardwareSnapshot(
+            deviceModel = deviceModel,
+            androidVersion = androidVer,
+            primaryCpuAbi = primaryAbi,
+            isLowLatencyAudioSupported = lowLatency,
+            isProAudioSupported = proAudio,
+            nativeSampleRateHz = sampleRate,
+            nativeBufferFrames = framesPerBuffer,
+            availableMemoryMb = availMb,
+            totalMemoryMb = totalMb
+        )
+    }
+}
 
 object AlexConfig {
     const val ASSISTANT_NAME = "ALEX"
     const val DEFAULT_USER_TITLE = "Boss"
-    const val APP_VERSION = "2.4.0-LIVE"
+    const val APP_VERSION = "2.5.0-LIVE"
 
-    // Centralized Gemini Model Configuration
-    const val DEFAULT_LIVE_MODEL = "gemini-2.0-flash-live-preview-04-09"
-    const val ALT_LIVE_MODEL = "gemini-2.5-flash-live-preview"
+    // Centralized Gemini 3.x+ Model Configuration (per Firebase AI Logic guidelines)
+    const val DEFAULT_LIVE_MODEL = "gemini-3.8-flash"
+    const val FAST_LIVE_MODEL = "gemini-3.5-flash-lite"
     const val DEFAULT_CHAT_MODEL = "gemini-3.8-flash"
     const val FAST_CHAT_MODEL = "gemini-3.5-flash-lite"
     const val REASONING_MODEL = "gemini-4-argon"
@@ -18,8 +108,8 @@ object AlexConfig {
 
     val AVAILABLE_LIVE_MODELS = listOf(
         DEFAULT_LIVE_MODEL,
-        ALT_LIVE_MODEL,
-        DEFAULT_CHAT_MODEL
+        FAST_LIVE_MODEL,
+        TTS_MODEL
     )
 
     val AVAILABLE_CHAT_MODELS = listOf(
@@ -28,13 +118,14 @@ object AlexConfig {
         REASONING_MODEL
     )
 
-    // Audio Configuration Constants for Gemini Live API
+    // Audio Configuration Constants for Real-Time Live Voice
     const val INPUT_SAMPLE_RATE_HZ = 16000
     const val OUTPUT_SAMPLE_RATE_HZ = 24000
     const val AUDIO_MIME_TYPE = "audio/pcm"
+    const val AUDIO_WAV_MIME_TYPE = "audio/wav"
     const val GENERATION_TIMEOUT_MS = 60_000L
 
-    // Officially Supported Female Voices in Gemini Live
+    // Officially Supported Female Voices
     val FEMALE_VOICES = listOf(
         FemaleVoiceOption(
             id = "Aoede",
@@ -61,6 +152,14 @@ object AlexConfig {
             recommendedFor = "Quick daily interactions"
         )
     )
+
+    fun sanitizeModelName(modelName: String?, defaultModel: String = DEFAULT_CHAT_MODEL): String {
+        if (modelName.isNullOrBlank()) return defaultModel
+        if (modelName.startsWith("gemini-1.") || modelName.startsWith("gemini-2.")) {
+            return defaultModel
+        }
+        return modelName
+    }
 
     fun buildSystemInstruction(
         userTitle: String = DEFAULT_USER_TITLE,
