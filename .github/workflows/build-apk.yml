@@ -16,45 +16,62 @@ permissions:
   contents: write
   actions: read
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  ORG_GRADLE_PROJECT_android_aapt2FromMavenOverride: ""
+
 jobs:
   build-android-apk:
     name: Compile & Package Native Android APK
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
 
     steps:
       - name: 1. Checkout Repository
         uses: actions/checkout@v4
 
-      - name: 2. Set up JDK 21 (Temurin)
-        uses: actions/setup-java@v4
-        with:
-          distribution: "temurin"
-          java-version: "21"
-
-      - name: 3. Set up Android SDK & Accept Licenses
-        uses: android-actions/setup-android@v3
-        with:
-          packages: "tools platform-tools build-tools;36.0.0"
-
-      - name: 4. Accept All Android SDK Licenses
+      - name: 2. Configure Pre-installed JDK 21
         run: |
-          yes | sdkmanager --licenses || true
+          if [ -n "${JAVA_HOME_21_X64:-}" ] && [ -d "${JAVA_HOME_21_X64}" ]; then
+            echo "JAVA_HOME=${JAVA_HOME_21_X64}" >> "$GITHUB_ENV"
+            echo "${JAVA_HOME_21_X64}/bin" >> "$GITHUB_PATH"
+          elif [ -d "/usr/lib/jvm/temurin-21-jdk-amd64" ]; then
+            echo "JAVA_HOME=/usr/lib/jvm/temurin-21-jdk-amd64" >> "$GITHUB_ENV"
+            echo "/usr/lib/jvm/temurin-21-jdk-amd64/bin" >> "$GITHUB_PATH"
+          else
+            sudo apt-get update
+            sudo apt-get install -y openjdk-21-jdk
+            JAVA21_DIR=$(dirname $(dirname $(readlink -f $(which javac))))
+            echo "JAVA_HOME=${JAVA21_DIR}" >> "$GITHUB_ENV"
+            echo "${JAVA21_DIR}/bin" >> "$GITHUB_PATH"
+          fi
+          java -version
 
-      - name: 5. Prepare .env and Debug Keystore for CI Build
+      - name: 3. Configure Android SDK & Accept All Licenses
+        run: |
+          ANDROID_SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_HOME=${ANDROID_SDK}" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK}" >> "$GITHUB_ENV"
+          sudo chmod -R a+rwx "${ANDROID_SDK}" || true
+
+          SDKMANAGER=$(find "${ANDROID_SDK}" -name sdkmanager -type f 2>/dev/null | head -n 1 || true)
+          if [ -n "${SDKMANAGER}" ]; then
+            chmod +x "${SDKMANAGER}" || true
+            (yes || true) | "${SDKMANAGER}" --licenses > /dev/null 2>&1 || true
+          fi
+
+      - name: 4. Prepare .env and Debug Keystore for APK Signing
         env:
           SECRET_GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
-          # Ensure .env exists for the Secrets Gradle Plugin
           if [ ! -f ".env" ]; then
             cp .env.example .env
           fi
-          if [ -n "$SECRET_GEMINI_API_KEY" ]; then
+          if [ -n "${SECRET_GEMINI_API_KEY:-}" ]; then
             echo "" >> .env
-            echo "GEMINI_API_KEY=$SECRET_GEMINI_API_KEY" >> .env
+            echo "GEMINI_API_KEY=${SECRET_GEMINI_API_KEY}" >> .env
           fi
 
-          # Restore debug.keystore from debug.keystore.base64 (or generate if needed)
           if [ ! -f "debug.keystore" ]; then
             if [ -f "debug.keystore.base64" ]; then
               base64 -d debug.keystore.base64 > debug.keystore
@@ -71,28 +88,23 @@ jobs:
             fi
           fi
 
-      - name: 6. Set up Gradle 9.3.1
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: "9.3.1"
-          cache-read-only: false
-
-      - name: 7. Build Installable Debug APK
+      - name: 5. Compile & Package Installable Debug APK
         run: |
-          if [ -f "./gradlew" ]; then
+          if [ -f "./gradlew" ] && [ -f "gradle/wrapper/gradle-wrapper.jar" ]; then
             chmod +x ./gradlew
             ./gradlew :app:assembleDebug --no-daemon --stacktrace
           else
-            gradle :app:assembleDebug --no-daemon --stacktrace
+            GRADLE_VER="9.3.1"
+            curl -fsSL "https://services.gradle.org/distributions/gradle-${GRADLE_VER}-bin.zip" -o /tmp/gradle.zip
+            sudo unzip -q -d /opt /tmp/gradle.zip
+            /opt/gradle-${GRADLE_VER}/bin/gradle :app:assembleDebug --no-daemon --stacktrace
           fi
 
-      - name: 8. Prepare Clean APK Output Directory
-        run: |
           mkdir -p dist-apk
           cp app/build/outputs/apk/debug/app-debug.apk dist-apk/ALEX-AI-v1.0.0-debug.apk
           ls -lh dist-apk/
 
-      - name: 9. Upload Installable APK to GitHub Actions Artifacts
+      - name: 6. Upload Installable APK to GitHub Actions Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ALEX-AI-Android-APK
@@ -102,17 +114,17 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: 10. Publish APK to GitHub Releases (On Tag or Main Push)
-        if: github.event_name == 'push' && (startsWith(github.ref, 'refs/tags/') || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'latest-apk-build' }}
-          name: "ALEX AI Native Android APK (${{ github.sha }})"
-          body: |
-            ### ALEX AI — Native Kotlin + Java Android APK
-            - **Download APK**: Install `ALEX-AI-v1.0.0-debug.apk` directly on your Android phone (Android 8.0+).
-            - **Manual Gemini API Key**: Open the app → tap **SET API KEY** → paste your `AIzaSy...` key → tap **SAVE & GO ONLINE**.
-          files: |
-            dist-apk/ALEX-AI-v1.0.0-debug.apk
-          prerelease: false
+      - name: 7. Publish APK to GitHub Releases via GitHub CLI
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG_NAME="latest-apk-build"
+          if ! gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release create "$TAG_NAME" "dist-apk/ALEX-AI-v1.0.0-debug.apk" \
+              --title "ALEX AI Native Android APK (Latest Build)" \
+              --notes "Download and install ALEX-AI-v1.0.0-debug.apk on Android 8.0+. Open the app, tap SET API KEY, paste your Gemini API Key (AIzaSy...), and tap SAVE & GO ONLINE."
+          else
+            gh release upload "$TAG_NAME" "dist-apk/ALEX-AI-v1.0.0-debug.apk" --clobber
+          fi
         continue-on-error: true
